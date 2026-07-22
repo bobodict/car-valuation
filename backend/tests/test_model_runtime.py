@@ -181,29 +181,40 @@ def write_catboost_artifacts(root):
     return write_v3_contract(root, "catboost", {"model": "catboost.cbm"})
 
 
-def write_legacy_artifacts(root):
+def write_legacy_artifacts(
+    root,
+    numeric_features=("mileage",),
+    categorical_features=("brand",),
+):
+    feature_cols = [*numeric_features, *categorical_features]
     feature_config = {
         "artifact_version": "2.0.0",
-        "feature_cols": ["mileage", "brand"],
-        "numeric_features": ["mileage"],
-        "categorical_features": ["brand"],
+        "feature_cols": feature_cols,
+        "numeric_features": list(numeric_features),
+        "categorical_features": list(categorical_features),
     }
     (root / "feature_config.json").write_text(
         json.dumps(feature_config), encoding="utf-8"
     )
-    training_frame = pd.DataFrame(
-        {"mileage": [1.0, 2.0], "brand": ["Honda", "Toyota"]}
-    )
-    preprocessor = ColumnTransformer(
-        [
-            ("numeric", StandardScaler(), ["mileage"]),
+    training_values = {
+        **{name: [1.0, 2.0] for name in numeric_features},
+        **{name: ["Honda", "Toyota"] for name in categorical_features},
+    }
+    training_frame = pd.DataFrame(training_values)
+    transformers = []
+    if numeric_features:
+        transformers.append(
+            ("numeric", StandardScaler(), list(numeric_features))
+        )
+    if categorical_features:
+        transformers.append(
             (
                 "categorical",
                 OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-                ["brand"],
-            ),
-        ]
-    )
+                list(categorical_features),
+            )
+        )
+    preprocessor = ColumnTransformer(transformers)
     transformed = preprocessor.fit_transform(training_frame)
     joblib.dump(preprocessor, root / "preprocess.joblib")
     model = MLPRegressor(transformed.shape[1], hidden_dims=(2,), dropout=0.0)
@@ -230,6 +241,40 @@ def replace_with_symlink(test_case, link_path, target_path):
         os.symlink(target_path, link_path)
     except OSError as exc:
         test_case.skipTest(f"symlink creation is unavailable: {exc}")
+
+
+def write_cache_v3_publication(
+    root,
+    model_version="v3-cache-first",
+    artifact_bytes=b"artifact-v1",
+    feature_marker="feature-v1",
+):
+    manifest = {
+        "model_version": model_version,
+        "model_type": "extra_trees",
+        "model_artifacts": {"bundle": "winner.joblib"},
+    }
+    (root / "model_manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True), encoding="utf-8"
+    )
+    (root / "feature_config.json").write_text(
+        json.dumps({"marker": feature_marker}, sort_keys=True), encoding="utf-8"
+    )
+    (root / "winner.joblib").write_bytes(artifact_bytes)
+
+
+def write_cache_legacy_publication(root, model_bytes=b"legacy-model-v1"):
+    manifest_path = root / "model_manifest.json"
+    if manifest_path.exists():
+        manifest_path.unlink()
+    v3_artifact = root / "winner.joblib"
+    if v3_artifact.exists():
+        v3_artifact.unlink()
+    (root / "feature_config.json").write_text(
+        json.dumps({"artifact_version": "2.0.0"}), encoding="utf-8"
+    )
+    (root / "preprocess.joblib").write_bytes(b"legacy-preprocessor")
+    (root / "price_mlp.pt").write_bytes(model_bytes)
 
 
 class ModelRuntimeLoadingTests(unittest.TestCase):
@@ -312,6 +357,28 @@ class ModelRuntimeLoadingTests(unittest.TestCase):
                 runtime.predict_one({"mileage": 10_000, "brand": "Honda"}),
                 200.0,
             )
+
+    def test_legacy_all_numeric_and_all_categorical_partitions_predict(self):
+        cases = (
+            (("mileage",), (), {"mileage": 10_000}),
+            ((), ("brand",), {"brand": "Honda"}),
+        )
+        for numeric, categorical, vehicle in cases:
+            with self.subTest(
+                numeric=numeric,
+                categorical=categorical,
+            ):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_legacy_artifacts(
+                        root,
+                        numeric_features=numeric,
+                        categorical_features=categorical,
+                    )
+
+                    runtime = ModelRuntime.from_directory(root)
+
+                    self.assertEqual(runtime.predict_one(vehicle), 200.0)
 
     def test_checked_in_legacy_artifacts_load_and_predict(self):
         models_dir = Path(__file__).resolve().parents[1] / "models"
@@ -870,9 +937,7 @@ class PredictServiceRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "model_manifest.json").write_text(
-                json.dumps({"model_version": "v3-first"}), encoding="utf-8"
-            )
+            write_cache_v3_publication(root)
             runtime = Mock()
             callers = 8
             start = threading.Barrier(callers)
@@ -910,10 +975,7 @@ class PredictServiceRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manifest_path = root / "model_manifest.json"
-            manifest_path.write_text(
-                json.dumps({"model_version": "v3-first"}), encoding="utf-8"
-            )
+            write_cache_v3_publication(root, model_version="v3-first")
             first_runtime = Mock()
             second_runtime = Mock()
             fake_settings = SimpleNamespace(
@@ -931,10 +993,7 @@ class PredictServiceRuntimeTests(unittest.TestCase):
                 ) as loader,
             ):
                 self.assertIs(predict_service.get_model_runtime(), first_runtime)
-                manifest_path.write_text(
-                    json.dumps({"model_version": "v3-second"}),
-                    encoding="utf-8",
-                )
+                write_cache_v3_publication(root, model_version="v3-second")
                 self.assertIs(predict_service.get_model_runtime(), second_runtime)
 
             self.assertEqual(loader.call_count, 2)
@@ -945,9 +1004,7 @@ class PredictServiceRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = root / "model_manifest.json"
-            manifest_path.write_text(
-                json.dumps({"model_version": "v3-first"}), encoding="utf-8"
-            )
+            write_cache_v3_publication(root, model_version="v3-first")
             first_runtime = Mock()
             second_runtime = Mock()
             fake_settings = SimpleNamespace(
@@ -967,10 +1024,7 @@ class PredictServiceRuntimeTests(unittest.TestCase):
                 self.assertIs(predict_service.get_model_runtime(), first_runtime)
                 manifest_path.unlink()
                 self.assertIs(predict_service.get_model_runtime(), first_runtime)
-                manifest_path.write_text(
-                    json.dumps({"model_version": "v3-second"}),
-                    encoding="utf-8",
-                )
+                write_cache_v3_publication(root, model_version="v3-second")
                 self.assertIs(predict_service.get_model_runtime(), second_runtime)
 
             self.assertEqual(loader.call_count, 2)
@@ -980,12 +1034,7 @@ class PredictServiceRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for filename, contents in (
-                ("feature_config.json", b"{}"),
-                ("preprocess.joblib", b"preprocess-v1"),
-                ("price_mlp.pt", b"model-v1"),
-            ):
-                (root / filename).write_bytes(contents)
+            write_cache_legacy_publication(root)
             first_runtime = Mock()
             second_runtime = Mock()
             fake_settings = SimpleNamespace(
@@ -1006,6 +1055,208 @@ class PredictServiceRuntimeTests(unittest.TestCase):
                 self.assertIs(predict_service.get_model_runtime(), second_runtime)
 
             self.assertEqual(loader.call_count, 2)
+
+    def test_v3_artifact_replacement_reloads_with_unchanged_manifest(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_publication(
+                root,
+                artifact_bytes=b"a" * 100_000,
+            )
+            manifest_bytes = (root / "model_manifest.json").read_bytes()
+            first_runtime = Mock()
+            second_runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=[first_runtime, second_runtime],
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                (root / "winner.joblib").write_bytes(b"b" * 900_000)
+                self.assertEqual(
+                    (root / "model_manifest.json").read_bytes(), manifest_bytes
+                )
+                self.assertIs(predict_service.get_model_runtime(), second_runtime)
+
+            self.assertEqual(loader.call_count, 2)
+
+    def test_feature_config_change_reloads_and_malformed_json_is_explicit(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_publication(root)
+            first_runtime = Mock()
+            second_runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=[first_runtime, second_runtime],
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                (root / "feature_config.json").write_text(
+                    json.dumps({"marker": "feature-v2"}), encoding="utf-8"
+                )
+                self.assertIs(predict_service.get_model_runtime(), second_runtime)
+                (root / "feature_config.json").write_text("{broken", encoding="utf-8")
+                with self.assertRaisesRegex(ModelRuntimeError, "JSON|identity|invalid"):
+                    predict_service.get_model_runtime()
+
+            self.assertEqual(loader.call_count, 2)
+
+    def test_stable_v3_to_legacy_rollback_reloads_runtime(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_publication(root)
+            first_runtime = Mock()
+            legacy_runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=[first_runtime, legacy_runtime],
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                write_cache_legacy_publication(root)
+                self.assertIs(predict_service.get_model_runtime(), legacy_runtime)
+
+            self.assertEqual(loader.call_count, 2)
+
+    def test_loader_discards_intermediate_publication_and_returns_final(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_publication(root, model_version="v3-intermediate")
+            intermediate_runtime = Mock()
+            final_runtime = Mock()
+            load_count = 0
+
+            def load_during_transition(_root):
+                nonlocal load_count
+                load_count += 1
+                if load_count == 1:
+                    write_cache_v3_publication(
+                        root,
+                        model_version="v3-final",
+                        artifact_bytes=b"final-artifact",
+                        feature_marker="feature-final",
+                    )
+                    return intermediate_runtime
+                return final_runtime
+
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=load_during_transition,
+                ) as loader,
+            ):
+                runtime = predict_service.get_model_runtime()
+
+            self.assertIs(runtime, final_runtime)
+            self.assertEqual(loader.call_count, 2)
+
+    def test_repeated_identity_gap_has_bounded_stale_fallback(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_publication(root)
+            runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    return_value=runtime,
+                ),
+            ):
+                self.assertIs(predict_service.get_model_runtime(), runtime)
+                with patch.object(
+                    predict_service,
+                    "_published_artifact_identity",
+                    side_effect=OSError("publication gap"),
+                ):
+                    self.assertIs(predict_service.get_model_runtime(), runtime)
+                    with self.assertRaisesRegex(ModelRuntimeError, "unavailable|gap"):
+                        predict_service.get_model_runtime()
+
+    def test_successful_identity_read_resets_gap_failure_budget(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_publication(root)
+            runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    return_value=runtime,
+                ),
+            ):
+                self.assertIs(predict_service.get_model_runtime(), runtime)
+                stable_identity = predict_service._cached_identity
+                with patch.object(
+                    predict_service,
+                    "_published_artifact_identity",
+                    side_effect=(
+                        OSError("gap one"),
+                        stable_identity,
+                        OSError("gap two"),
+                        OSError("gap three"),
+                    ),
+                ):
+                    self.assertIs(predict_service.get_model_runtime(), runtime)
+                    self.assertIs(predict_service.get_model_runtime(), runtime)
+                    self.assertIs(predict_service.get_model_runtime(), runtime)
+                    with self.assertRaises(ModelRuntimeError):
+                        predict_service.get_model_runtime()
 
 
 if __name__ == "__main__":

@@ -357,10 +357,11 @@ def _legacy_feature_names(config: Mapping[str, Any]) -> tuple[
         values = config[name]
         if (
             not isinstance(values, list)
-            or not values
             or any(not isinstance(value, str) or not value for value in values)
         ):
-            raise ValueError(f"legacy {name} must be a nonempty list of feature names")
+            raise ValueError(f"legacy {name} must be a list of feature names")
+        if name == "feature_cols" and not values:
+            raise ValueError("legacy feature_cols must be nonempty")
         if len(values) != len(set(values)):
             raise ValueError(f"legacy {name} must contain unique feature names")
         validated.append(tuple(values))
