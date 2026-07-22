@@ -1,3 +1,4 @@
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -76,6 +77,22 @@ class PredictionContractTests(unittest.TestCase):
     @patch("services.model_service.predict_price_one", side_effect=RuntimeError("broken"))
     def test_model_failure_is_not_hidden_by_a_rule_fallback(self, _predict):
         with self.assertRaises(ModelServiceError):
+            call_model_api(make_request())
+
+    @patch("services.model_service.load_metrics")
+    @patch(
+        "services.model_service.predict_price_one",
+        return_value=sys.float_info.max,
+    )
+    def test_response_rejects_price_when_reference_range_would_overflow(
+        self, _predict, load_metrics_mock
+    ):
+        load_metrics_mock.return_value = {
+            "quality_gate": "fail",
+            "test_metrics": {"r2": 0.0},
+        }
+
+        with self.assertRaisesRegex(ModelServiceError, "range|finite|invalid"):
             call_model_api(make_request())
 
 

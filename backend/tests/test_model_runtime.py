@@ -1,9 +1,14 @@
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 import json
 import math
+import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import joblib
@@ -11,7 +16,9 @@ import numpy as np
 import pandas as pd
 import torch
 from catboost import CatBoostRegressor
-from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from services.feature_engineering import (
     CATEGORICAL_FEATURES,
@@ -19,7 +26,13 @@ from services.feature_engineering import (
     NUMERIC_FEATURES,
     enrich_features,
 )
-from services.model_competition import MLPRegressor, _build_fold_preprocessor
+from services.model_competition import (
+    CandidateConfig,
+    ExtraTreesCandidateAdapter,
+    MLPRegressor,
+    _build_fold_preprocessor,
+)
+from services import model_runtime as model_runtime_module
 from services.model_runtime import ModelRuntime, ModelRuntimeError
 
 
@@ -27,22 +40,16 @@ EXPECTED_PRICE = 505_000.0
 LOG_EXPECTED_PRICE = math.log1p(EXPECTED_PRICE)
 
 
-class FittedPassthroughPreprocessor:
-    def __init__(self):
-        self.fitted_ = True
+class SpoofedFittedComponent:
+    def __init__(self, feature_width):
+        self.fitted_ = False
+        self.n_features_in_ = feature_width
 
-    def transform(self, frame):
-        return np.zeros((len(frame), 1), dtype=float)
-
-
-class StaticPredictor:
-    def __init__(self, output):
-        self.output = output
-        self.fitted_ = True
-        self.n_features_in_ = 1
+    def fit(self, features, targets=None):
+        return self
 
     def predict(self, features):
-        return self.output
+        return np.zeros(len(features), dtype=float)
 
 
 def raw_vehicles(count=4):
@@ -110,12 +117,12 @@ def write_v3_contract(root, model_type, artifacts):
     return manifest, feature_config
 
 
-def write_extra_trees_artifacts(root):
+def write_extra_trees_artifacts(root, log_target=LOG_EXPECTED_PRICE):
     features = canonical_features()
     preprocessor = _build_fold_preprocessor(scale_numeric=False)
     transformed = preprocessor.fit_transform(features)
     model = ExtraTreesRegressor(n_estimators=2, random_state=42)
-    model.fit(transformed, np.full(len(features), LOG_EXPECTED_PRICE))
+    model.fit(transformed, np.full(len(features), log_target))
     joblib.dump(
         {
             "preprocessor": preprocessor,
@@ -177,27 +184,36 @@ def write_catboost_artifacts(root):
 def write_legacy_artifacts(root):
     feature_config = {
         "artifact_version": "2.0.0",
-        "feature_cols": ["mileage"],
+        "feature_cols": ["mileage", "brand"],
         "numeric_features": ["mileage"],
-        "categorical_features": [],
+        "categorical_features": ["brand"],
     }
     (root / "feature_config.json").write_text(
         json.dumps(feature_config), encoding="utf-8"
     )
-    # Legacy artifacts may use a non-v3 feature contract, so use a minimal
-    # fitted transformer matching the saved feature list.
-    from sklearn.preprocessing import StandardScaler
-
-    preprocessor = StandardScaler().fit(pd.DataFrame({"mileage": [1.0, 2.0]}))
+    training_frame = pd.DataFrame(
+        {"mileage": [1.0, 2.0], "brand": ["Honda", "Toyota"]}
+    )
+    preprocessor = ColumnTransformer(
+        [
+            ("numeric", StandardScaler(), ["mileage"]),
+            (
+                "categorical",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                ["brand"],
+            ),
+        ]
+    )
+    transformed = preprocessor.fit_transform(training_frame)
     joblib.dump(preprocessor, root / "preprocess.joblib")
-    model = MLPRegressor(1, hidden_dims=(2,), dropout=0.0)
+    model = MLPRegressor(transformed.shape[1], hidden_dims=(2,), dropout=0.0)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
         model.net[-1].bias.fill_(2.0)
     torch.save(
         {
-            "input_dim": 1,
+            "input_dim": transformed.shape[1],
             "hidden_dims": [2],
             "dropout": 0.0,
             "model_state": model.state_dict(),
@@ -208,7 +224,45 @@ def write_legacy_artifacts(root):
     )
 
 
+def replace_with_symlink(test_case, link_path, target_path):
+    link_path.unlink()
+    try:
+        os.symlink(target_path, link_path)
+    except OSError as exc:
+        test_case.skipTest(f"symlink creation is unavailable: {exc}")
+
+
 class ModelRuntimeLoadingTests(unittest.TestCase):
+    def test_loads_bundle_written_by_production_extra_trees_adapter(self):
+        source = raw_vehicles(4)
+        training_frame = enrich_features(source, 2026).loc[:, MODEL_FEATURES]
+        training_frame["price"] = [400_000.0, 450_000.0, 500_000.0, 550_000.0]
+        adapter = ExtraTreesCandidateAdapter(
+            CandidateConfig(
+                "runtime-integration",
+                "extra_trees",
+                {
+                    "n_estimators": 2,
+                    "min_samples_leaf": 1,
+                    "max_features": 1.0,
+                    "n_jobs": 1,
+                },
+                1,
+            ),
+            seed=42,
+        ).fit(training_frame)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = adapter.save(root)
+            write_v3_contract(root, "extra_trees", metadata["artifacts"])
+            runtime = ModelRuntime.from_directory(root)
+
+            actual = runtime.predict(source)
+            expected = adapter.predict(training_frame.loc[:, MODEL_FEATURES])
+
+            np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
+
     def test_catboost_manifest_loads_and_inverts_log_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -254,7 +308,18 @@ class ModelRuntimeLoadingTests(unittest.TestCase):
 
             runtime = ModelRuntime.from_directory(root)
 
-            self.assertEqual(runtime.predict_one({"mileage": 10_000}), 200.0)
+            self.assertEqual(
+                runtime.predict_one({"mileage": 10_000, "brand": "Honda"}),
+                200.0,
+            )
+
+    def test_checked_in_legacy_artifacts_load_and_predict(self):
+        models_dir = Path(__file__).resolve().parents[1] / "models"
+
+        runtime = ModelRuntime.from_directory(models_dir)
+        prediction = runtime.predict_one(raw_vehicles(1).iloc[0].to_dict())
+
+        self.assertTrue(math.isfinite(prediction))
 
     def test_predict_one_requires_a_mapping(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -267,6 +332,221 @@ class ModelRuntimeLoadingTests(unittest.TestCase):
 
 
 class ModelRuntimeValidationTests(unittest.TestCase):
+    def test_predict_does_not_rewrap_runtime_error_or_memory_error(self):
+        implementation = Mock()
+        runtime = ModelRuntime(implementation)
+        errors = (ModelRuntimeError("existing"), MemoryError("memory"))
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                implementation.predict.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    runtime.predict(pd.DataFrame([{"mileage": 1.0}]))
+                self.assertIs(raised.exception, error)
+
+    def test_load_does_not_rewrap_runtime_error_or_memory_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_legacy_artifacts(root)
+            errors = (ModelRuntimeError("existing"), MemoryError("memory"))
+            for error in errors:
+                with self.subTest(error=type(error).__name__):
+                    with patch.object(
+                        model_runtime_module.LegacyTorchRuntime,
+                        "from_directory",
+                        side_effect=error,
+                    ):
+                        with self.assertRaises(type(error)) as raised:
+                            ModelRuntime.from_directory(root)
+                    self.assertIs(raised.exception, error)
+
+    def test_rejects_finite_log_prediction_above_safe_downstream_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_extra_trees_artifacts(root, log_target=1_000_000.0)
+            runtime = ModelRuntime.from_directory(root)
+
+            with self.assertRaisesRegex(ModelRuntimeError, "safe|limit|large"):
+                runtime.predict(raw_vehicles(1))
+
+    def test_safe_log_boundary_leaves_two_times_float_headroom(self):
+        safe_price = np.finfo(float).max / 4.0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_extra_trees_artifacts(
+                root, log_target=float(np.log1p(safe_price))
+            )
+            runtime = ModelRuntime.from_directory(root)
+
+            prediction = runtime.predict(raw_vehicles(1))[0]
+
+            self.assertTrue(math.isfinite(prediction * 2.0))
+
+    def test_rejects_external_symlinked_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "models"
+            root.mkdir()
+            write_extra_trees_artifacts(root)
+            external_manifest = parent / "external-manifest.json"
+            external_manifest.write_bytes((root / "model_manifest.json").read_bytes())
+            replace_with_symlink(
+                self, root / "model_manifest.json", external_manifest
+            )
+
+            with self.assertRaisesRegex(ModelRuntimeError, "symlink|inside"):
+                ModelRuntime.from_directory(root)
+
+    def test_rejects_external_symlinked_v3_feature_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "models"
+            root.mkdir()
+            write_extra_trees_artifacts(root)
+            external_config = parent / "external-feature-config.json"
+            external_config.write_bytes((root / "feature_config.json").read_bytes())
+            replace_with_symlink(
+                self, root / "feature_config.json", external_config
+            )
+
+            with self.assertRaisesRegex(ModelRuntimeError, "symlink|inside"):
+                ModelRuntime.from_directory(root)
+
+    def test_rejects_external_legacy_preprocessor_before_joblib_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "models"
+            root.mkdir()
+            write_legacy_artifacts(root)
+            external_preprocessor = parent / "external-preprocess.joblib"
+            external_preprocessor.write_bytes(
+                (root / "preprocess.joblib").read_bytes()
+            )
+            replace_with_symlink(
+                self, root / "preprocess.joblib", external_preprocessor
+            )
+
+            with patch.object(
+                model_runtime_module.joblib,
+                "load",
+                wraps=joblib.load,
+            ) as load:
+                with self.assertRaisesRegex(ModelRuntimeError, "symlink|inside"):
+                    ModelRuntime.from_directory(root)
+
+            load.assert_not_called()
+
+    def test_audits_legacy_symlink_components_before_joblib_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_legacy_artifacts(root)
+            original_is_symlink = Path.is_symlink
+
+            def mark_preprocessor_as_symlink(path):
+                return path.name == "preprocess.joblib" or original_is_symlink(path)
+
+            with (
+                patch.object(
+                    Path,
+                    "is_symlink",
+                    autospec=True,
+                    side_effect=mark_preprocessor_as_symlink,
+                ),
+                patch.object(
+                    model_runtime_module.joblib,
+                    "load",
+                    wraps=joblib.load,
+                ) as load,
+            ):
+                with self.assertRaisesRegex(ModelRuntimeError, "symlink"):
+                    ModelRuntime.from_directory(root)
+
+            load.assert_not_called()
+
+    def test_rejects_nonpositive_legacy_target_std(self):
+        for target_std in (0.0, -1.0):
+            with self.subTest(target_std=target_std):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_legacy_artifacts(root)
+                    checkpoint = torch.load(
+                        root / "price_mlp.pt",
+                        map_location="cpu",
+                        weights_only=True,
+                    )
+                    checkpoint["target_std"] = target_std
+                    torch.save(checkpoint, root / "price_mlp.pt")
+
+                    with self.assertRaisesRegex(ModelRuntimeError, "target_std|positive"):
+                        ModelRuntime.from_directory(root)
+
+    def test_rejects_invalid_legacy_feature_partitions(self):
+        mutations = (
+            (
+                "duplicate",
+                lambda config: config.update(
+                    feature_cols=[*config["feature_cols"], "mileage"]
+                ),
+            ),
+            (
+                "overlap",
+                lambda config: config.update(
+                    categorical_features=[
+                        *config["categorical_features"],
+                        "mileage",
+                    ]
+                ),
+            ),
+            (
+                "omission",
+                lambda config: config.update(feature_cols=["mileage"]),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_legacy_artifacts(root)
+                    config_path = root / "feature_config.json"
+                    config = json.loads(config_path.read_text(encoding="utf-8"))
+                    mutate(config)
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+                    with self.assertRaisesRegex(
+                        ModelRuntimeError, "unique|overlap|compose|feature"
+                    ):
+                        ModelRuntime.from_directory(root)
+
+    def test_rejects_legacy_preprocessor_checkpoint_width_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_legacy_artifacts(root)
+            checkpoint = torch.load(
+                root / "price_mlp.pt", map_location="cpu", weights_only=True
+            )
+            mismatched = MLPRegressor(
+                checkpoint["input_dim"] + 1,
+                tuple(checkpoint["hidden_dims"]),
+                checkpoint["dropout"],
+            )
+            checkpoint["input_dim"] += 1
+            checkpoint["model_state"] = mismatched.state_dict()
+            torch.save(checkpoint, root / "price_mlp.pt")
+
+            with self.assertRaisesRegex(ModelRuntimeError, "contract|width"):
+                ModelRuntime.from_directory(root)
+
+    def test_rejects_wrong_legacy_preprocessor_family(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_legacy_artifacts(root)
+            wrong_preprocessor = StandardScaler().fit(
+                pd.DataFrame({"mileage": [1.0, 2.0]})
+            )
+            joblib.dump(wrong_preprocessor, root / "preprocess.joblib")
+
+            with self.assertRaisesRegex(ModelRuntimeError, "legacy|preprocessor|type"):
+                ModelRuntime.from_directory(root)
+
     def test_rejects_malformed_or_unknown_manifest_without_legacy_fallback(self):
         invalid_payloads = ("not-json", "[]")
         for payload in invalid_payloads:
@@ -359,10 +639,13 @@ class ModelRuntimeValidationTests(unittest.TestCase):
     def test_rejects_unfitted_or_structurally_invalid_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            features = canonical_features()
+            preprocessor = _build_fold_preprocessor(scale_numeric=False)
+            transformed = preprocessor.fit_transform(features)
             joblib.dump(
                 {
-                    "preprocessor": FittedPassthroughPreprocessor(),
-                    "model": object(),
+                    "preprocessor": preprocessor,
+                    "model": SpoofedFittedComponent(transformed.shape[1]),
                     "target_transform": "log1p",
                 },
                 root / "extra_trees.joblib",
@@ -372,6 +655,41 @@ class ModelRuntimeValidationTests(unittest.TestCase):
             )
 
             with self.assertRaises(ModelRuntimeError):
+                ModelRuntime.from_directory(root)
+
+    def test_rejects_fitted_wrong_extra_trees_model_family(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            features = canonical_features()
+            preprocessor = _build_fold_preprocessor(scale_numeric=False)
+            transformed = preprocessor.fit_transform(features)
+            model = RandomForestRegressor(n_estimators=1, random_state=42)
+            model.fit(transformed, np.full(len(features), LOG_EXPECTED_PRICE))
+            joblib.dump(
+                {
+                    "preprocessor": preprocessor,
+                    "model": model,
+                    "target_transform": "log1p",
+                },
+                root / "extra_trees.joblib",
+            )
+            write_v3_contract(
+                root, "extra_trees", {"bundle": "extra_trees.joblib"}
+            )
+
+            with self.assertRaisesRegex(ModelRuntimeError, "ExtraTrees|family|type"):
+                ModelRuntime.from_directory(root)
+
+    def test_rejects_wrong_v3_mlp_preprocessor_family(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_mlp_artifacts(root)
+            wrong_preprocessor = StandardScaler().fit(
+                pd.DataFrame({"mileage": [1.0, 2.0]})
+            )
+            joblib.dump(wrong_preprocessor, root / "mlp_preprocessor.joblib")
+
+            with self.assertRaisesRegex(ModelRuntimeError, "MLP|preprocessor|type"):
                 ModelRuntime.from_directory(root)
 
     def test_rejects_mlp_preprocessor_and_checkpoint_width_mismatch(self):
@@ -447,6 +765,30 @@ class ModelRuntimeValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ModelRuntimeError, "contract|feature"):
                 ModelRuntime.from_directory(root)
 
+    def test_rejects_catboost_without_canonical_categorical_indices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            features = canonical_features()
+            for column in CATEGORICAL_FEATURES:
+                features[column] = 1.0
+            model = CatBoostRegressor(
+                iterations=1,
+                depth=1,
+                allow_const_label=True,
+                allow_writing_files=False,
+                verbose=False,
+            )
+            model.fit(
+                features,
+                np.full(len(features), LOG_EXPECTED_PRICE),
+                verbose=False,
+            )
+            model.save_model(root / "catboost.cbm")
+            write_v3_contract(root, "catboost", {"model": "catboost.cbm"})
+
+            with self.assertRaisesRegex(ModelRuntimeError, "categorical|indices"):
+                ModelRuntime.from_directory(root)
+
     def test_rejects_nonfinite_wrong_shape_and_wrong_length_predictions(self):
         invalid_outputs = (
             np.array([np.nan, np.nan]),
@@ -457,21 +799,16 @@ class ModelRuntimeValidationTests(unittest.TestCase):
             with self.subTest(shape=output.shape):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
-                    joblib.dump(
-                        {
-                            "preprocessor": FittedPassthroughPreprocessor(),
-                            "model": StaticPredictor(output),
-                            "target_transform": "log1p",
-                        },
-                        root / "extra_trees.joblib",
-                    )
-                    write_v3_contract(
-                        root, "extra_trees", {"bundle": "extra_trees.joblib"}
-                    )
+                    write_extra_trees_artifacts(root)
                     runtime = ModelRuntime.from_directory(root)
 
-                    with self.assertRaises(ModelRuntimeError):
-                        runtime.predict(raw_vehicles(2))
+                    with patch.object(
+                        runtime._implementation.model,
+                        "predict",
+                        return_value=output,
+                    ):
+                        with self.assertRaises(ModelRuntimeError):
+                            runtime.predict(raw_vehicles(2))
 
 
 class PredictServiceRuntimeTests(unittest.TestCase):
@@ -506,7 +843,7 @@ class PredictServiceRuntimeTests(unittest.TestCase):
             second = predict_service.predict_price_one({"brand": "Toyota"})
 
         self.assertEqual((first, second), (123.0, 123.0))
-        loader.assert_called_once_with(predict_service.settings.experiment_path)
+        loader.assert_called_once_with(predict_service.settings.models_dir)
 
     def test_cache_clear_and_reload_load_a_new_runtime(self):
         import predict_service
@@ -527,6 +864,148 @@ class PredictServiceRuntimeTests(unittest.TestCase):
             self.assertEqual(predict_service.predict_price_one({}), 2.0)
 
         self.assertEqual(loader.call_count, 2)
+
+    def test_concurrent_cold_start_loads_runtime_once(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model_manifest.json").write_text(
+                json.dumps({"model_version": "v3-first"}), encoding="utf-8"
+            )
+            runtime = Mock()
+            callers = 8
+            start = threading.Barrier(callers)
+
+            def load_once(_root):
+                time.sleep(0.05)
+                return runtime
+
+            def get_runtime():
+                start.wait(timeout=2)
+                return predict_service.get_model_runtime()
+
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+                experiment_path=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=load_once,
+                ) as loader,
+                ThreadPoolExecutor(max_workers=callers) as executor,
+            ):
+                runtimes = list(executor.map(lambda _: get_runtime(), range(callers)))
+
+            self.assertTrue(all(value is runtime for value in runtimes))
+            loader.assert_called_once_with(root)
+
+    def test_manifest_content_replacement_automatically_reloads_runtime(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "model_manifest.json"
+            manifest_path.write_text(
+                json.dumps({"model_version": "v3-first"}), encoding="utf-8"
+            )
+            first_runtime = Mock()
+            second_runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+                experiment_path=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=[first_runtime, second_runtime],
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                manifest_path.write_text(
+                    json.dumps({"model_version": "v3-second"}),
+                    encoding="utf-8",
+                )
+                self.assertIs(predict_service.get_model_runtime(), second_runtime)
+
+            self.assertEqual(loader.call_count, 2)
+
+    def test_manifest_gap_keeps_old_runtime_until_complete_identity_appears(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "model_manifest.json"
+            manifest_path.write_text(
+                json.dumps({"model_version": "v3-first"}), encoding="utf-8"
+            )
+            first_runtime = Mock()
+            second_runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+                experiment_path=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=[first_runtime, second_runtime],
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                manifest_path.unlink()
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                manifest_path.write_text(
+                    json.dumps({"model_version": "v3-second"}),
+                    encoding="utf-8",
+                )
+                self.assertIs(predict_service.get_model_runtime(), second_runtime)
+
+            self.assertEqual(loader.call_count, 2)
+
+    def test_legacy_artifact_identity_change_automatically_reloads_runtime(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename, contents in (
+                ("feature_config.json", b"{}"),
+                ("preprocess.joblib", b"preprocess-v1"),
+                ("price_mlp.pt", b"model-v1"),
+            ):
+                (root / filename).write_bytes(contents)
+            first_runtime = Mock()
+            second_runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=[first_runtime, second_runtime],
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                (root / "price_mlp.pt").write_bytes(b"model-v2-longer")
+                self.assertIs(predict_service.get_model_runtime(), second_runtime)
+
+            self.assertEqual(loader.call_count, 2)
 
 
 if __name__ == "__main__":

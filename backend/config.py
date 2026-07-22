@@ -45,12 +45,12 @@ class Settings:
     models_dir: Path = BACKEND_DIR / "models"
 
     @property
-    def experiment_path(self) -> Path:
+    def published_models_dir(self) -> Path:
         return self.models_dir
 
     @property
     def manifest_path(self) -> Path:
-        return self.experiment_path / "model_manifest.json"
+        return self.published_models_dir / "model_manifest.json"
 
     @property
     def model_manifest_path(self) -> Path:
@@ -58,19 +58,19 @@ class Settings:
 
     @property
     def preprocess_path(self) -> Path:
-        return self.experiment_path / "preprocess.joblib"
+        return self.published_models_dir / "preprocess.joblib"
 
     @property
     def feature_config_path(self) -> Path:
-        return self.experiment_path / "feature_config.json"
+        return self.published_models_dir / "feature_config.json"
 
     @property
     def model_path(self) -> Path:
-        return self.experiment_path / "price_mlp.pt"
+        return self.published_models_dir / "price_mlp.pt"
 
     @property
     def metrics_path(self) -> Path:
-        return self.experiment_path / "metrics.json"
+        return self.published_models_dir / "metrics.json"
 
     @property
     def knowledge_path(self) -> Path:

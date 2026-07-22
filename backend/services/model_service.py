@@ -62,6 +62,11 @@ def call_model_api(req: PredictRequest) -> dict:
     price = round(raw_price, 2)
     reference_low = round(price * 0.92, 2)
     reference_high = round(price * 1.08, 2)
+    if not all(
+        math.isfinite(value)
+        for value in (price, reference_low, reference_high)
+    ):
+        raise ModelServiceError("model returned an invalid non-finite price range")
     quality_gate = metrics.get("quality_gate", "fail")
     model_status = "usable" if quality_gate == "pass" else "experimental"
     source_id = metrics.get("data_source", {}).get("source_id", "unknown source")

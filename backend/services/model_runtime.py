@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 import torch
 from catboost import CatBoostRegressor
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.utils.validation import check_is_fitted
 
 from services.feature_engineering import (
@@ -29,6 +31,8 @@ from services.model_competition import MLPRegressor
 ARTIFACT_VERSION = "3.0.0"
 FEATURE_VERSION = "3.0.0"
 MODEL_CONTRACT_VERSION = "3.0.0"
+_MAX_SAFE_PRICE = np.finfo(float).max / 4.0
+_MAX_SAFE_LOG_TARGET = np.log1p(_MAX_SAFE_PRICE)
 _MODEL_ARTIFACT_ROLES = {
     "catboost": {"model"},
     "extra_trees": {"bundle"},
@@ -63,6 +67,43 @@ def _load_json_object(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"{label} must contain a JSON object")
     return value
+
+
+def _validated_models_root(root: Path) -> Path:
+    if root.is_symlink():
+        raise ValueError("models directory must not be a symlink")
+    if not root.is_dir():
+        raise FileNotFoundError(f"models directory does not exist: {root}")
+    return root.resolve(strict=True)
+
+
+def _resolve_models_file(
+    root: Path, relative_path: str | Path, label: str
+) -> Path:
+    resolved_root = _validated_models_root(root)
+    relative = Path(relative_path)
+    if relative.is_absolute():
+        raise ValueError(f"{label} must remain inside models directory")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} path must not contain symlinks")
+    resolved = (root / relative).resolve()
+    if not resolved.is_relative_to(resolved_root):
+        raise ValueError(f"{label} must remain inside models directory")
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} is missing: {relative_path}")
+    return resolved
+
+
+def _optional_models_file(root: Path, filename: str) -> Path | None:
+    candidate = root / filename
+    if candidate.is_symlink():
+        raise ValueError(f"{filename} path must not contain symlinks")
+    if not candidate.exists():
+        return None
+    return _resolve_models_file(root, filename, filename)
 
 
 def _require_fields(
@@ -176,38 +217,25 @@ def _resolve_artifacts(
             f"{model_type} model_artifacts must declare exactly "
             f"{sorted(expected_roles)}"
         )
-    resolved_root = root.resolve()
     artifacts = {}
     for role, relative_path in declared.items():
         if not isinstance(relative_path, str) or not relative_path.strip():
             raise TypeError(f"model artifact path for {role} must be a string")
-        candidate = Path(relative_path)
-        if candidate.is_absolute():
-            raise ValueError("model artifact paths must remain inside models directory")
-        resolved = (root / candidate).resolve()
-        if not resolved.is_relative_to(resolved_root):
-            raise ValueError("model artifact paths must remain inside models directory")
-        if not resolved.is_file():
-            raise FileNotFoundError(f"model artifact is missing: {relative_path}")
-        artifacts[role] = resolved
+        artifacts[role] = _resolve_models_file(
+            root, relative_path, f"model artifact {role}"
+        )
     return artifacts
 
 
-def _require_fitted(component: Any, label: str) -> None:
+def _require_fitted(
+    component: Any, label: str, attributes: tuple[str, ...]
+) -> None:
     try:
-        check_is_fitted(component)
-        return
-    except TypeError:
-        fitted_attributes = [
-            name
-            for name in vars(component)
-            if name.endswith("_") and not name.startswith("__")
-        ]
-        if fitted_attributes:
-            return
-    except Exception as exc:
+        check_is_fitted(component, attributes=attributes)
+    except MemoryError:
+        raise
+    except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(f"{label} is not fitted") from exc
-    raise ValueError(f"{label} is not fitted")
 
 
 def _validate_mlp_checkpoint(checkpoint: Any) -> tuple[int, tuple[int, ...], float]:
@@ -280,7 +308,11 @@ def _prediction_vector(values: Any, expected_length: int, label: str) -> np.ndar
 
 def _inverse_log_predictions(values: Any, expected_length: int) -> np.ndarray:
     transformed = _prediction_vector(values, expected_length, "log target")
-    bounded = np.clip(transformed, 0.0, np.log(np.finfo(float).max))
+    if np.any(transformed > _MAX_SAFE_LOG_TARGET):
+        raise ValueError(
+            "log target prediction exceeds the safe downstream price limit"
+        )
+    bounded = np.clip(transformed, 0.0, _MAX_SAFE_LOG_TARGET)
     with np.errstate(over="ignore", invalid="ignore"):
         predictions = np.expm1(bounded)
     predictions = _prediction_vector(predictions, expected_length, "price")
@@ -301,6 +333,10 @@ def _preprocessor_output_width(
         :, MODEL_FEATURES
     ]
     transformed = preprocessor.transform(features)
+    return _matrix_width(transformed, label)
+
+
+def _matrix_width(transformed: Any, label: str) -> int:
     shape = getattr(transformed, "shape", None)
     if (
         not isinstance(shape, tuple)
@@ -311,6 +347,33 @@ def _preprocessor_output_width(
     ):
         raise ValueError(f"{label} output must be a nonempty 2-D feature matrix")
     return int(shape[1])
+
+
+def _legacy_feature_names(config: Mapping[str, Any]) -> tuple[
+    tuple[str, ...], tuple[str, ...], tuple[str, ...]
+]:
+    validated = []
+    for name in ("feature_cols", "numeric_features", "categorical_features"):
+        values = config[name]
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value for value in values)
+        ):
+            raise ValueError(f"legacy {name} must be a nonempty list of feature names")
+        if len(values) != len(set(values)):
+            raise ValueError(f"legacy {name} must contain unique feature names")
+        validated.append(tuple(values))
+    feature_cols, numeric_features, categorical_features = validated
+    numeric_set = set(numeric_features)
+    categorical_set = set(categorical_features)
+    if numeric_set.intersection(categorical_set):
+        raise ValueError("legacy numeric and categorical features must not overlap")
+    if numeric_set.union(categorical_set) != set(feature_cols):
+        raise ValueError(
+            "legacy numeric and categorical features must compose feature_cols"
+        )
+    return feature_cols, numeric_features, categorical_features
 
 
 class _V3Runtime:
@@ -329,7 +392,10 @@ class _V3Runtime:
     @classmethod
     def from_directory(cls, root: Path, manifest: Mapping[str, Any]):
         model_type, collection_year = _validate_manifest(manifest)
-        config = _load_json_object(root / "feature_config.json", "feature_config.json")
+        config_path = _resolve_models_file(
+            root, "feature_config.json", "feature_config.json"
+        )
+        config = _load_json_object(config_path, "feature_config.json")
         _validate_feature_config(config, manifest)
         artifacts = _resolve_artifacts(
             root, model_type, manifest["model_artifacts"]
@@ -352,6 +418,14 @@ class _V3Runtime:
                 raise ValueError(
                     "CatBoost saved feature contract does not match MODEL_FEATURES"
                 )
+            expected_categorical_indices = [
+                MODEL_FEATURES.index(column) for column in CATEGORICAL_FEATURES
+            ]
+            if list(model.get_cat_feature_indices()) != expected_categorical_indices:
+                raise ValueError(
+                    "CatBoost categorical feature indices do not match "
+                    "CATEGORICAL_FEATURES"
+                )
             return cls(model_type, collection_year, model)
 
         if model_type == "extra_trees":
@@ -367,12 +441,22 @@ class _V3Runtime:
                 raise ValueError("ExtraTrees bundle target_transform must be log1p")
             preprocessor = bundle["preprocessor"]
             model = bundle["model"]
-            if not callable(getattr(preprocessor, "transform", None)):
-                raise ValueError("ExtraTrees preprocessor must support transform")
-            if not callable(getattr(model, "predict", None)):
-                raise ValueError("ExtraTrees model must support predict")
-            _require_fitted(preprocessor, "ExtraTrees preprocessor")
-            _require_fitted(model, "ExtraTrees model")
+            if type(preprocessor) is not ColumnTransformer:
+                raise TypeError(
+                    "ExtraTrees preprocessor must be a ColumnTransformer"
+                )
+            if type(model) is not ExtraTreesRegressor:
+                raise TypeError("ExtraTrees model must be an ExtraTreesRegressor")
+            _require_fitted(
+                preprocessor,
+                "ExtraTrees preprocessor",
+                ("transformers_", "n_features_in_"),
+            )
+            _require_fitted(
+                model,
+                "ExtraTrees model",
+                ("estimators_", "n_features_in_"),
+            )
             transformed_width = _preprocessor_output_width(
                 preprocessor, collection_year, "ExtraTrees preprocessor"
             )
@@ -393,9 +477,13 @@ class _V3Runtime:
             return cls(model_type, collection_year, model, preprocessor)
 
         preprocessor = joblib.load(artifacts["preprocessor"])
-        if not callable(getattr(preprocessor, "transform", None)):
-            raise ValueError("MLP preprocessor must support transform")
-        _require_fitted(preprocessor, "MLP preprocessor")
+        if type(preprocessor) is not ColumnTransformer:
+            raise TypeError("MLP preprocessor must be a ColumnTransformer")
+        _require_fitted(
+            preprocessor,
+            "MLP preprocessor",
+            ("transformers_", "n_features_in_"),
+        )
         checkpoint = torch.load(
             artifacts["model"], map_location="cpu", weights_only=True
         )
@@ -460,36 +548,43 @@ class LegacyTorchRuntime:
 
     @classmethod
     def from_directory(cls, root: Path):
-        config = _load_json_object(root / "feature_config.json", "feature_config.json")
+        config_path = _resolve_models_file(
+            root, "feature_config.json", "feature_config.json"
+        )
+        preprocessor_path = _resolve_models_file(
+            root, "preprocess.joblib", "legacy preprocessor artifact"
+        )
+        model_path = _resolve_models_file(
+            root, "price_mlp.pt", "legacy model artifact"
+        )
+        config = _load_json_object(config_path, "feature_config.json")
         _require_fields(
             config,
             {"feature_cols", "numeric_features", "categorical_features"},
             "legacy feature_config.json",
         )
-        feature_cols = config["feature_cols"]
-        numeric_features = config["numeric_features"]
-        categorical_features = config["categorical_features"]
-        for name, values in (
-            ("feature_cols", feature_cols),
-            ("numeric_features", numeric_features),
-            ("categorical_features", categorical_features),
-        ):
-            if not isinstance(values, list) or any(
-                not isinstance(value, str) or not value for value in values
-            ):
-                raise ValueError(f"legacy {name} must be a list of feature names")
-        if not feature_cols:
-            raise ValueError("legacy feature_cols must not be empty")
+        feature_cols, numeric_features, categorical_features = (
+            _legacy_feature_names(config)
+        )
 
-        preprocessor_path = root / "preprocess.joblib"
-        model_path = root / "price_mlp.pt"
-        for path in (preprocessor_path, model_path):
-            if not path.is_file():
-                raise FileNotFoundError(f"legacy model artifact is missing: {path.name}")
         preprocessor = joblib.load(preprocessor_path)
-        if not callable(getattr(preprocessor, "transform", None)):
-            raise ValueError("legacy preprocessor must support transform")
-        _require_fitted(preprocessor, "legacy preprocessor")
+        if type(preprocessor) is not ColumnTransformer:
+            raise TypeError("legacy preprocessor must be a ColumnTransformer")
+        _require_fitted(
+            preprocessor,
+            "legacy preprocessor",
+            ("transformers_", "n_features_in_"),
+        )
+        probe = {
+            **{column: 1.0 for column in numeric_features},
+            **{column: "unknown" for column in categorical_features},
+        }
+        transformed_width = _matrix_width(
+            preprocessor.transform(
+                pd.DataFrame([probe]).reindex(columns=feature_cols)
+            ),
+            "legacy preprocessor",
+        )
 
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
         if not isinstance(checkpoint, Mapping):
@@ -507,15 +602,26 @@ class LegacyTorchRuntime:
         input_dim, hidden_dims, dropout = _validate_mlp_checkpoint(
             legacy_checkpoint
         )
+        if transformed_width != input_dim:
+            raise ValueError(
+                "legacy feature/model contract width mismatch: "
+                f"preprocessor={transformed_width}, checkpoint={input_dim}"
+            )
         target_mean = checkpoint.get("target_mean", 0.0)
         target_std = checkpoint.get("target_std", 1.0)
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, Real)
-            or not math.isfinite(float(value))
-            for value in (target_mean, target_std)
+        if (
+            isinstance(target_mean, bool)
+            or not isinstance(target_mean, Real)
+            or not math.isfinite(float(target_mean))
         ):
-            raise ValueError("legacy target scaling values must be finite numbers")
+            raise ValueError("legacy target_mean must be a finite number")
+        if (
+            isinstance(target_std, bool)
+            or not isinstance(target_std, Real)
+            or not math.isfinite(float(target_std))
+            or float(target_std) <= 0
+        ):
+            raise ValueError("legacy target_std must be finite and positive")
         model = MLPRegressor(input_dim, hidden_dims, dropout)
         model.load_state_dict(checkpoint["model_state"], strict=True)
         model.eval()
@@ -570,12 +676,9 @@ class ModelRuntime:
     def from_directory(cls, models_dir: str | Path) -> ModelRuntime:
         root = Path(models_dir)
         try:
-            if not root.is_dir():
-                raise FileNotFoundError(f"models directory does not exist: {root}")
-            manifest_path = root / "model_manifest.json"
-            if manifest_path.exists():
-                if not manifest_path.is_file():
-                    raise ValueError("model_manifest.json must be a file")
+            _validated_models_root(root)
+            manifest_path = _optional_models_file(root, "model_manifest.json")
+            if manifest_path is not None:
                 manifest = _load_json_object(
                     manifest_path, "model_manifest.json"
                 )
@@ -583,6 +686,8 @@ class ModelRuntime:
             else:
                 implementation = LegacyTorchRuntime.from_directory(root)
             return cls(implementation)
+        except (ModelRuntimeError, MemoryError):
+            raise
         except Exception as exc:
             raise ModelRuntimeError(
                 f"failed to load model runtime from {root}: {exc}"
@@ -594,6 +699,8 @@ class ModelRuntime:
         try:
             predictions = self._implementation.predict(frame)
             return _prediction_vector(predictions, len(frame), "runtime")
+        except (ModelRuntimeError, MemoryError):
+            raise
         except Exception as exc:
             raise ModelRuntimeError(f"model prediction failed: {exc}") from exc
 
