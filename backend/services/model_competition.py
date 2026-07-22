@@ -129,7 +129,10 @@ def _relative_accuracy_hits(
     nonzero_actual = actual != 0
     ratio = np.zeros_like(predicted, dtype=float)
     np.divide(predicted, actual, out=ratio, where=nonzero_actual)
-    hits = (ratio >= 1.0 - threshold) & (ratio <= 1.0 + threshold)
+    # Allow only one ULP for the multiplication/division rounding step.
+    lower = np.nextafter(1.0 - threshold, -np.inf)
+    upper = np.nextafter(1.0 + threshold, np.inf)
+    hits = (ratio >= lower) & (ratio <= upper)
     hits[~nonzero_actual] = (
         np.abs(predicted[~nonzero_actual]) / 1e-8 <= threshold
     )

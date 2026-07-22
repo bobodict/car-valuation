@@ -84,6 +84,49 @@ class ModelCompetitionTests(unittest.TestCase):
         self.assertEqual(exact["acc_20"], 1.0)
         self.assertEqual(outside["acc_20"], 0.0)
 
+    def test_relative_accuracy_counts_exact_bounds_across_magnitudes(self):
+        actual = np.array(
+            [3.0, 9.0, 43.0, 109.0, 0.1, 123.456, 1e-6, 1e9]
+        )
+
+        for threshold, metric_name in ((0.10, "acc_10"), (0.20, "acc_20")):
+            for factor in (1.0 - threshold, 1.0 + threshold):
+                with self.subTest(threshold=threshold, factor=factor):
+                    metrics = calculate_metrics(
+                        actual,
+                        actual * factor,
+                        actual,
+                    )
+
+                    self.assertEqual(metrics[metric_name], 1.0)
+
+    def test_relative_accuracy_rejects_factors_outside_exact_bounds(self):
+        actual = np.array(
+            [3.0, 9.0, 43.0, 109.0, 0.1, 123.456, 1e-6, 1e9]
+        )
+        outside_cases = (
+            ("acc_10", 0.899999999999999),
+            ("acc_10", 1.100000000000001),
+            ("acc_20", 0.799999999999999),
+            ("acc_20", 1.200000000000001),
+        )
+
+        for metric_name, factor in outside_cases:
+            with self.subTest(metric_name=metric_name, factor=factor):
+                metrics = calculate_metrics(actual, actual * factor, actual)
+
+                self.assertEqual(metrics[metric_name], 0.0)
+
+    def test_relative_accuracy_preserves_zero_actual_fallback(self):
+        metrics = calculate_metrics(
+            actual=np.array([0.0, 0.0]),
+            predicted=np.array([0.0, 1e-8]),
+            baseline=np.array([0.0, 0.0]),
+        )
+
+        self.assertEqual(metrics["acc_10"], 0.5)
+        self.assertEqual(metrics["acc_20"], 0.5)
+
     def test_candidate_config_and_search_spaces_are_exact_and_bounded(self):
         config = CandidateConfig(
             name="cat-depth-6",
