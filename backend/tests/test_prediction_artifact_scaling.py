@@ -1,28 +1,22 @@
 import unittest
 from unittest.mock import Mock, patch
 
-import numpy as np
-import torch
-
 import predict_service
 
 
 class PredictionArtifactScalingTests(unittest.TestCase):
-    def test_prediction_unscales_training_target_before_returning_price(self):
-        fake_model = Mock(return_value=torch.tensor([[2.0]]))
-        with patch.object(predict_service.preprocess, "transform", return_value=np.zeros((1, 3))):
-            with patch.object(predict_service, "model", fake_model):
-                old_mean = getattr(predict_service, "TARGET_MEAN", None)
-                old_std = getattr(predict_service, "TARGET_STD", None)
-                predict_service.TARGET_MEAN = 100.0
-                predict_service.TARGET_STD = 50.0
-                try:
-                    result = predict_service.predict_price_one({"brand": "Honda", "year": 2018})
-                finally:
-                    predict_service.TARGET_MEAN = old_mean
-                    predict_service.TARGET_STD = old_std
+    def test_prediction_delegates_target_scaling_to_runtime(self):
+        runtime = Mock()
+        runtime.predict_one.return_value = 200.0
+        vehicle = {"brand": "Honda", "year": 2018}
+
+        with patch.object(
+            predict_service, "get_model_runtime", return_value=runtime
+        ):
+            result = predict_service.predict_price_one(vehicle)
 
         self.assertEqual(result, 200.0)
+        runtime.predict_one.assert_called_once_with(vehicle)
 
 
 if __name__ == "__main__":
