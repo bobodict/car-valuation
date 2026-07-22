@@ -12,4 +12,5 @@ pydantic-core>=2.16.0
 pandas>=2.0.0
 joblib>=1.4.0
 scikit-learn==1.6.1
+catboost>=1.2.8,<2.0
 torch>=2.3.0

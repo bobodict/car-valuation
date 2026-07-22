@@ -20,7 +20,28 @@ REQUIRED_DATASET_COLUMNS = (
     "vehicle_type",
     "color",
     "accident_history",
+    "seller_type",
+    "drivetrain",
+    "max_power_bhp",
+    "power_rpm",
+    "max_torque_nm",
+    "torque_rpm",
+    "length_mm",
+    "width_mm",
+    "height_mm",
+    "fuel_tank_liter",
 )
+
+_PHYSICAL_VALUE_BOUNDS = {
+    "max_power_bhp": (0.0, 2000.0, False),
+    "power_rpm": (0.0, 25000.0, False),
+    "max_torque_nm": (0.0, 10000.0, False),
+    "torque_rpm": (0.0, 25000.0, False),
+    "length_mm": (1000.0, 10000.0, True),
+    "width_mm": (1000.0, 5000.0, True),
+    "height_mm": (500.0, 5000.0, True),
+    "fuel_tank_liter": (0.0, 1000.0, False),
+}
 
 
 def validate_dataset_columns(columns) -> list[str]:
@@ -37,6 +58,18 @@ def load_dataset(path: str | Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"数据集缺少必要字段：{', '.join(missing)}")
     return validate_normalized_frame(frame)
+
+
+def _validate_physical_values(frame: pd.DataFrame) -> None:
+    for column, (lower, upper, lower_inclusive) in _PHYSICAL_VALUE_BOUNDS.items():
+        values = pd.to_numeric(frame[column], errors="coerce")
+        invalid_numeric = frame[column].notna() & values.isna()
+        below_lower = values < lower if lower_inclusive else values <= lower
+        out_of_bounds = below_lower | (values > upper)
+        if invalid_numeric.any() or out_of_bounds.any():
+            raise ValueError(
+                f"{column} must be numeric and within its allowed physical range when provided"
+            )
 
 
 def validate_normalized_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -56,5 +89,7 @@ def validate_normalized_frame(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("mileage must contain only non-negative numeric values")
     if year.isna().any() or (year < 1980).any() or (year > current_year).any():
         raise ValueError("year must be between 1980 and the current year")
+
+    _validate_physical_values(frame)
 
     return frame
