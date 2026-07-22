@@ -62,11 +62,26 @@ def load_dataset(path: str | Path) -> pd.DataFrame:
 
 def _validate_physical_values(frame: pd.DataFrame) -> None:
     for column, (lower, upper, lower_inclusive) in _PHYSICAL_VALUE_BOUNDS.items():
-        values = pd.to_numeric(frame[column], errors="coerce")
-        invalid_numeric = frame[column].notna() & values.isna()
+        source = frame[column]
+        invalid_type = source.map(
+            lambda value: isinstance(
+                value, (bool, np.bool_, complex, np.complexfloating)
+            )
+        )
+        if invalid_type.any():
+            raise ValueError(
+                f"{column} must be numeric and within its allowed physical range when provided"
+            )
+
+        values = pd.to_numeric(source, errors="coerce").to_numpy(
+            dtype=float, na_value=np.nan
+        )
+        missing = source.isna().to_numpy(dtype=bool)
+        invalid_numeric = ~missing & np.isnan(values)
+        non_finite = ~missing & ~np.isfinite(values)
         below_lower = values < lower if lower_inclusive else values <= lower
         out_of_bounds = below_lower | (values > upper)
-        if invalid_numeric.any() or out_of_bounds.any():
+        if invalid_numeric.any() or non_finite.any() or out_of_bounds.any():
             raise ValueError(
                 f"{column} must be numeric and within its allowed physical range when provided"
             )

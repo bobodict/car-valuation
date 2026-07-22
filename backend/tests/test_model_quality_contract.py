@@ -70,11 +70,25 @@ class DatasetContractTests(unittest.TestCase):
 
         self.assertIn("mileage", missing)
         self.assertIn("city", missing)
-        self.assertEqual(len(REQUIRED_DATASET_COLUMNS), 24)
 
-    def test_dataset_contract_includes_v3_physical_and_source_columns(self):
-        self.assertTrue(
-            {
+    def test_dataset_contract_has_exact_normalized_column_order(self):
+        self.assertEqual(
+            REQUIRED_DATASET_COLUMNS,
+            (
+                "price",
+                "mileage",
+                "displacement",
+                "seats",
+                "owner_count",
+                "year",
+                "brand",
+                "model",
+                "city",
+                "transmission",
+                "fuel_type",
+                "vehicle_type",
+                "color",
+                "accident_history",
                 "seller_type",
                 "drivetrain",
                 "max_power_bhp",
@@ -85,9 +99,7 @@ class DatasetContractTests(unittest.TestCase):
                 "width_mm",
                 "height_mm",
                 "fuel_tank_liter",
-                "vehicle_type",
-                "accident_history",
-            }.issubset(REQUIRED_DATASET_COLUMNS)
+            ),
         )
 
     def test_physical_values_accept_exact_valid_boundaries(self):
@@ -158,6 +170,30 @@ class DatasetContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "max_power_bhp"):
             validate_normalized_frame(frame)
+
+    def test_bool_and_complex_physical_values_are_rejected_without_type_errors(self):
+        invalid_values = (
+            True,
+            np.bool_(True),
+            1 + 2j,
+            np.complex64(1 + 2j),
+            np.complex128(1 + 2j),
+        )
+
+        for value in invalid_values:
+            with self.subTest(value_type=type(value).__name__):
+                frame = make_valid_normalized_frame()
+                frame["max_power_bhp"] = pd.Series([value], dtype=object)
+                with self.assertRaisesRegex(ValueError, "max_power_bhp"):
+                    validate_normalized_frame(frame)
+
+    def test_infinite_physical_values_are_rejected(self):
+        for value in (np.inf, -np.inf):
+            with self.subTest(value=value):
+                frame = make_valid_normalized_frame()
+                frame.loc[0, "max_power_bhp"] = value
+                with self.assertRaisesRegex(ValueError, "max_power_bhp"):
+                    validate_normalized_frame(frame)
 
 
 if __name__ == "__main__":

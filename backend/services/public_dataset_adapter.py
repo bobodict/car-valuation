@@ -33,6 +33,14 @@ RAW_REQUIRED_COLUMNS = (
 
 _POWER_CONVERSIONS = {"bhp": 1.0, "ps": 0.98632, "kw": 1.34102}
 _TORQUE_CONVERSIONS = {"nm": 1.0, "kgm": 9.80665, "kg-m": 9.80665}
+_NUMBER_PATTERN = r"(?:\d+(?:\.\d+)?|\.\d+)"
+_UNIT_MEASUREMENT_PATTERN = re.compile(
+    rf"(?P<amount>-?{_NUMBER_PATTERN})\s*(?P<unit>[a-z-]+)"
+    rf"(?:\s*@(?:\s*(?P<rpm>{_NUMBER_PATTERN})\s*rpm)?\s*)?"
+)
+_COMPACT_MEASUREMENT_PATTERN = re.compile(
+    rf"(?P<amount>-?{_NUMBER_PATTERN})\s*@\s*(?P<rpm>{_NUMBER_PATTERN})"
+)
 
 
 def parse_engine_liters(value) -> float:
@@ -57,25 +65,32 @@ def map_owner_count(value) -> float:
     }.get(str(value).strip().lower(), np.nan)
 
 
-def _parse_measurement(value, conversions) -> tuple[float, float]:
+def _parse_measurement(value, conversions, compact_unit) -> tuple[float, float]:
     if value is None or pd.isna(value):
         return np.nan, np.nan
     text = str(value).strip().lower()
-    value_match = re.search(r"(-?\d+(?:\.\d+)?)\s*([a-z-]+)", text)
-    rpm_match = re.search(r"@\s*(\d+(?:\.\d+)?)\s*rpm", text)
-    if not value_match or value_match.group(2) not in conversions:
+    compact_match = _COMPACT_MEASUREMENT_PATTERN.fullmatch(text)
+    if compact_match:
+        amount = float(compact_match.group("amount")) * conversions[compact_unit]
+        return amount, float(compact_match.group("rpm"))
+
+    value_match = _UNIT_MEASUREMENT_PATTERN.fullmatch(text)
+    if not value_match or value_match.group("unit") not in conversions:
         return np.nan, np.nan
-    amount = float(value_match.group(1)) * conversions[value_match.group(2)]
-    rpm = float(rpm_match.group(1)) if rpm_match else np.nan
+    amount = (
+        float(value_match.group("amount"))
+        * conversions[value_match.group("unit")]
+    )
+    rpm = float(value_match.group("rpm")) if value_match.group("rpm") else np.nan
     return amount, rpm
 
 
 def parse_power(value) -> tuple[float, float]:
-    return _parse_measurement(value, _POWER_CONVERSIONS)
+    return _parse_measurement(value, _POWER_CONVERSIONS, "bhp")
 
 
 def parse_torque(value) -> tuple[float, float]:
-    return _parse_measurement(value, _TORQUE_CONVERSIONS)
+    return _parse_measurement(value, _TORQUE_CONVERSIONS, "nm")
 
 
 def adapt_car_details_v4(raw: pd.DataFrame) -> pd.DataFrame:
