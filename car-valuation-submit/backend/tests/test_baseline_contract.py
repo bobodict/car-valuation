@@ -8,46 +8,40 @@ from services.metrics_service import load_metrics
 from services.model_service import ModelServiceError, build_model_input, call_model_api
 
 
+def make_request():
+    return PredictRequest(
+        brand="Honda",
+        model="Amaze",
+        city="Pune",
+        mileage=87150,
+        year=2017,
+        month=6,
+        gearbox="Manual",
+        emission="unknown",
+        fuel_type="Petrol",
+        displacement=1.198,
+        seats=5,
+        owner_count=1,
+        vehicle_type="car",
+        color="Grey",
+        accident_history="unknown",
+    )
+
+
 class RequestContractTests(unittest.TestCase):
     def test_valid_request_keeps_public_units_and_values(self):
-        request = PredictRequest(
-            brand="大众",
-            model="帕萨特",
-            city="广州",
-            mileage=6.5,
-            year=2018,
-            month=6,
-            gearbox="自动",
-            emission="国六",
-        )
+        request = make_request()
 
-        self.assertEqual(request.mileage, 6.5)
-        self.assertEqual(request.model, "帕萨特")
+        self.assertEqual(request.mileage, 87150)
+        self.assertEqual(request.model, "Amaze")
+        self.assertEqual(request.fuel_type, "Petrol")
 
     def test_request_rejects_impossible_vehicle_values(self):
         with self.assertRaises(ValidationError):
-            PredictRequest(
-                brand="大众",
-                model="帕萨特",
-                city="广州",
-                mileage=-1,
-                year=2018,
-                month=6,
-                gearbox="自动",
-                emission="国六",
-            )
+            PredictRequest(**{**make_request().model_dump(), "mileage": -1})
 
         with self.assertRaises(ValidationError):
-            PredictRequest(
-                brand="大众",
-                model="帕萨特",
-                city="广州",
-                mileage=6.5,
-                year=2018,
-                month=13,
-                gearbox="自动",
-                emission="国六",
-            )
+            PredictRequest(**{**make_request().model_dump(), "month": 13})
 
     def test_history_query_rejects_unbounded_limits(self):
         self.assertEqual(HistoryQuery().limit, 20)
@@ -56,27 +50,15 @@ class RequestContractTests(unittest.TestCase):
 
 
 class ModelAdapterTests(unittest.TestCase):
-    def setUp(self):
-        self.request = PredictRequest(
-            brand="大众",
-            model="帕萨特",
-            city="广州",
-            mileage=6.5,
-            year=2018,
-            month=6,
-            gearbox="自动",
-            emission="国六",
-        )
+    def test_adapter_uses_source_categories_and_kilometers(self):
+        model_input = build_model_input(make_request())
 
-    def test_adapter_uses_fitted_chinese_categories_and_kilometers(self):
-        model_input = build_model_input(self.request)
-
-        self.assertEqual(model_input["mileage"], 65000)
-        self.assertEqual(model_input["transmission"], "自动")
-        self.assertEqual(model_input["fuel_type"], "汽油")
-        self.assertEqual(model_input["vehicle_type"], "轿车")
-        self.assertEqual(model_input["color"], "白色")
-        self.assertEqual(model_input["accident_history"], "无事故")
+        self.assertEqual(model_input["mileage"], 87150)
+        self.assertEqual(model_input["transmission"], "Manual")
+        self.assertEqual(model_input["fuel_type"], "Petrol")
+        self.assertEqual(model_input["displacement"], 1.198)
+        self.assertEqual(model_input["vehicle_type"], "car")
+        self.assertEqual(model_input["accident_history"], "unknown")
 
     @patch("services.model_service.load_metrics")
     @patch("services.model_service.predict_price_one", return_value=55742.34)
@@ -84,28 +66,35 @@ class ModelAdapterTests(unittest.TestCase):
         self, _predict, load_metrics_mock
     ):
         load_metrics_mock.return_value = {
-            "best_val_rmse": 13.177239209284734,
+            "quality_gate": "fail",
             "test_metrics": {
-                "mse": 177.17701721191406,
-                "rmse": 13.310785747352185,
-                "mae": 11.497577667236328,
-                "r2": -0.015273571014404297,
-                "acc_10": 0.11777777777777777,
+                "mse": 680398226160.8066,
+                "rmse": 824862.5498595549,
+                "mae": 403990.84203074436,
+                "r2": 0.8635845112741601,
+                "acc_10": 0.2912621359223301,
+                "baseline_rmse": 2234030.4642809303,
+                "baseline_r2": -0.000641919560930404,
             },
+            "currency": "INR",
+            "price_unit": "INR",
+            "mileage_unit": "km",
+            "model_version": "mlp-test",
         }
 
-        result = call_model_api(self.request)
+        result = call_model_api(make_request())
 
-        self.assertEqual(result["price"], 5.57)
+        self.assertEqual(result["price"], 55742.34)
         self.assertIsNone(result["confidence"])
         self.assertEqual(result["model_status"], "experimental")
-        self.assertEqual(result["metrics"]["r2"], -0.015273571014404297)
-        self.assertIn("参考", result["comment"])
+        self.assertEqual(result["quality_gate"], "fail")
+        self.assertEqual(result["currency"], "INR")
+        self.assertIn("R2=0.864", result["comment"])
 
     @patch("services.model_service.predict_price_one", side_effect=RuntimeError("broken"))
     def test_model_failure_is_not_hidden_by_a_rule_fallback(self, _predict):
         with self.assertRaises(ModelServiceError):
-            call_model_api(self.request)
+            call_model_api(make_request())
 
 
 class MetricsTests(unittest.TestCase):

@@ -14,5 +14,7 @@ class History(Base):
     gearbox = Column(String(50))
     emission = Column(String(50))
     price = Column(Float)
+    currency = Column(String(16), nullable=True)
+    model_version = Column(String(64), nullable=True)
     created_at = Column(TIMESTAMP)
     status = Column(String(50))

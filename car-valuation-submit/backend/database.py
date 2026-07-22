@@ -32,3 +32,22 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def ensure_history_metadata_columns(db_engine=engine):
+    """Add non-destructive model metadata columns to an existing SQLite table."""
+    if db_engine.dialect.name != "sqlite":
+        return
+    with db_engine.begin() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql("PRAGMA table_info(history)").fetchall()
+        }
+        for column_name, column_type in (
+            ("currency", "VARCHAR(16)"),
+            ("model_version", "VARCHAR(64)"),
+        ):
+            if column_name not in columns:
+                connection.exec_driver_sql(
+                    f'ALTER TABLE history ADD COLUMN "{column_name}" {column_type}'
+                )

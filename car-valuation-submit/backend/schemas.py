@@ -1,4 +1,3 @@
-# schemas.py
 from datetime import date, datetime
 from typing import Literal
 
@@ -12,13 +11,29 @@ class PredictRequest(BaseModel):
     brand: str = Field(min_length=1, max_length=100)
     model: str | None = Field(default=None, max_length=255)
     city: str = Field(min_length=1, max_length=100)
-    mileage: float = Field(ge=0, le=100)
+    mileage: float = Field(ge=0, le=10_000_000)
     year: int = Field(ge=1980, le=CURRENT_YEAR)
     month: int = Field(ge=1, le=12)
-    gearbox: Literal["自动", "手动", "其他"] = "自动"
-    emission: Literal["国六", "国五", "国四", "其他"] = "国六"
+    gearbox: str = Field(default="Automatic", min_length=1, max_length=50)
+    emission: str = Field(default="unknown", min_length=1, max_length=50)
+    fuel_type: str = Field(default="unknown", min_length=1, max_length=50)
+    displacement: float = Field(default=0.0, ge=0, le=10)
+    seats: int = Field(default=5, ge=1, le=20)
+    owner_count: int = Field(default=1, ge=1, le=20)
+    vehicle_type: str = Field(default="car", min_length=1, max_length=50)
+    color: str = Field(default="unknown", min_length=1, max_length=50)
+    accident_history: str = Field(default="unknown", min_length=1, max_length=50)
 
-    @field_validator("brand", "city")
+    @field_validator(
+        "brand",
+        "city",
+        "gearbox",
+        "emission",
+        "fuel_type",
+        "vehicle_type",
+        "color",
+        "accident_history",
+    )
     @classmethod
     def reject_blank_text(cls, value: str) -> str:
         value = value.strip()
@@ -122,7 +137,12 @@ class PredictResponse(BaseModel):
     price: float
     range: PriceRange
     confidence: float | None = None
-    model_status: Literal["experimental"]
+    model_status: Literal["experimental", "usable"]
+    quality_gate: Literal["pass", "fail"] = "fail"
+    currency: str = "INR"
+    price_unit: str = "INR"
+    mileage_unit: str = "km"
+    model_version: str = "unknown"
     metrics: TestMetrics
     comment: str
 
@@ -144,6 +164,8 @@ class HistoryOut(BaseModel):
     gearbox: str
     emission: str
     price: float
+    currency: str = "INR"
+    model_version: str = "unknown"
     created_at: datetime
     status: str
 

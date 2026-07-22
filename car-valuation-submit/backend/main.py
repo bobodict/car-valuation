@@ -8,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config import settings
-from database import Base, engine, get_db
+from database import Base, engine, ensure_history_metadata_columns, get_db
 from models import History
 from schemas import (
     AssistantRequest,
@@ -30,6 +30,7 @@ from services.model_quality_service import get_model_health
 
 
 Base.metadata.create_all(bind=engine)
+ensure_history_metadata_columns(engine)
 
 app = FastAPI(
     title="二手车价格预测系统后端",
@@ -62,6 +63,8 @@ def predict_car(body: PredictRequest, db: Session = Depends(get_db)):
         gearbox=body.gearbox,
         emission=body.emission,
         price=result["price"],
+        currency=result["currency"],
+        model_version=result["model_version"],
         created_at=datetime.now(timezone.utc).replace(tzinfo=None),
         status="experimental",
     )

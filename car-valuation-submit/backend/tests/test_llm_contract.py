@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from services.assistant_service import LLMNotConfiguredError, answer_user_message
+from services.assistant_service import ESTIMATE_VEHICLE_TOOL, LLMNotConfiguredError, answer_user_message
 from services.knowledge_service import retrieve_knowledge
 from services.llm_client import OpenAICompatibleClient
 
@@ -64,6 +64,17 @@ class ClientTests(unittest.TestCase):
 
 
 class AssistantTests(unittest.TestCase):
+    def test_estimate_tool_describes_public_units_and_full_features(self):
+        function = ESTIMATE_VEHICLE_TOOL["function"]
+        properties = function["parameters"]["properties"]
+
+        self.assertIn("km", function["description"])
+        self.assertIn("INR", function["description"])
+        self.assertIn("fuel_type", properties)
+        self.assertIn("displacement", properties)
+        self.assertIn("seats", properties)
+        self.assertIn("owner_count", properties)
+
     @patch("services.assistant_service.call_model_api")
     def test_tool_call_executes_estimator_and_returns_citations(self, predict_mock):
         predict_mock.return_value = {
