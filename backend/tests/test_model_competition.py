@@ -1,11 +1,16 @@
 import json
+import tempfile
 import unittest
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 
 from services import model_competition
+from services.feature_engineering import CATEGORICAL_FEATURES, MODEL_FEATURES
 from services.model_competition import (
     CATBOOST_CONFIGS,
     EXTRA_TREES_CONFIGS,
@@ -37,6 +42,86 @@ def candidate(
         "config": config or {},
         "test_metrics": {"acc_10": test_acc_10},
     }
+
+
+def make_cv_fixture():
+    row_ids = list(range(100, 112))
+    frame = pd.DataFrame(
+        {
+            "price": np.linspace(100_000.0, 210_000.0, len(row_ids)),
+            "year": [2020] * len(row_ids),
+            "mileage": np.linspace(10_000.0, 21_000.0, len(row_ids)),
+            "brand": ["Toyota", "Honda"] * 6,
+            "model": [f"model-{index % 3}" for index in range(len(row_ids))],
+        },
+        index=row_ids,
+    )
+    development = row_ids[:10]
+    folds = []
+    for fold_number in range(5):
+        validation = development[fold_number * 2 : fold_number * 2 + 2]
+        folds.append(
+            {
+                "fold": fold_number,
+                "train": [row_id for row_id in development if row_id not in validation],
+                "validation": validation,
+            }
+        )
+    manifest = {
+        "development": development,
+        "test": row_ids[10:],
+        "n_splits": 5,
+        "folds": folds,
+    }
+    return frame, manifest
+
+
+def tiny_candidate_configs():
+    return (
+        CandidateConfig(
+            "tiny-catboost",
+            "catboost",
+            {
+                "depth": 2,
+                "learning_rate": 0.1,
+                "l2_leaf_reg": 3.0,
+                "loss_function": "RMSE",
+                "iterations": 6,
+                "early_stopping_patience": 2,
+            },
+            1,
+        ),
+        CandidateConfig(
+            "tiny-extra-trees",
+            "extra_trees",
+            {
+                "n_estimators": 5,
+                "min_samples_leaf": 1,
+                "max_features": 1.0,
+                "n_jobs": 1,
+            },
+            1,
+        ),
+        CandidateConfig(
+            "tiny-mlp",
+            "mlp",
+            {
+                "hidden_dims": (8,),
+                "dropout": 0.0,
+                "learning_rate": 0.01,
+                "max_epochs": 4,
+                "early_stopping_patience": 2,
+            },
+            1,
+        ),
+    )
+
+
+class TestReadGuard(dict):
+    def __getitem__(self, key):
+        if key == "test":
+            raise AssertionError("evaluate_candidate read the outer test IDs")
+        return super().__getitem__(key)
 
 
 class ModelCompetitionTests(unittest.TestCase):
@@ -356,6 +441,363 @@ class ModelCompetitionTests(unittest.TestCase):
                 "MLP_EARLY_STOPPING_PATIENCE": 40,
             },
         )
+
+    def test_evaluate_candidate_uses_only_recorded_fold_rows(self):
+        evaluate_candidate = getattr(
+            model_competition,
+            "evaluate_candidate",
+            None,
+        )
+        self.assertIsNotNone(evaluate_candidate)
+        frame, manifest = make_cv_fixture()
+        manifest = TestReadGuard(manifest)
+        config = CandidateConfig(
+            "tiny-extra-trees",
+            "extra_trees",
+            {
+                "n_estimators": 1,
+                "min_samples_leaf": 1,
+                "max_features": 1.0,
+                "n_jobs": 1,
+            },
+            1,
+        )
+        observed_fits = []
+
+        class RecordingAdapter:
+            def fit(self, train_frame, validation_frame=None):
+                observed_fits.append(
+                    {
+                        "train": train_frame.index.tolist(),
+                        "validation": validation_frame.index.tolist(),
+                    }
+                )
+                self.prediction = float(train_frame["price"].mean())
+                return self
+
+            def predict(self, prediction_frame):
+                return np.full(len(prediction_frame), self.prediction)
+
+            def save(self, directory):
+                return {"model_type": "recording"}
+
+        with patch.object(
+            model_competition,
+            "_create_adapter",
+            create=True,
+            side_effect=lambda candidate_config, seed: RecordingAdapter(),
+        ):
+            result = evaluate_candidate(frame, manifest, config, seed=42)
+
+        self.assertEqual(len(result["fold_metrics"]), 5)
+        for observed, expected in zip(
+            result["observed_validation_indices"],
+            manifest["folds"],
+        ):
+            self.assertEqual(observed, expected["validation"])
+        self.assertEqual(
+            observed_fits,
+            [
+                {
+                    "train": fold["train"],
+                    "validation": fold["validation"],
+                }
+                for fold in manifest["folds"]
+            ],
+        )
+        self.assertNotIn("test_metrics", result)
+        self.assertTrue(
+            {
+                "acc_10_mean",
+                "acc_10_std",
+                "median_ape_mean",
+                "r2_mean",
+                "rmse_mean",
+                "baseline_rmse_mean",
+            }.issubset(result["cv"])
+        )
+
+    def test_default_candidates_cover_all_model_families(self):
+        default_candidates = getattr(
+            model_competition,
+            "default_candidates",
+            None,
+        )
+        self.assertIsNotNone(default_candidates)
+        self.assertEqual(
+            {item.model_type for item in default_candidates()},
+            {"catboost", "extra_trees", "mlp"},
+        )
+
+        first = default_candidates()
+        second = default_candidates()
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 11)
+        self.assertEqual(len({item.name for item in first}), 11)
+        self.assertTrue(all(item.complexity >= 0 for item in first))
+
+    def test_manifest_contract_requires_outer_test_membership(self):
+        evaluate_candidate = getattr(
+            model_competition,
+            "evaluate_candidate",
+            None,
+        )
+        self.assertIsNotNone(evaluate_candidate)
+        frame, manifest = make_cv_fixture()
+        del manifest["test"]
+        config = tiny_candidate_configs()[1]
+
+        class NoOpAdapter:
+            def fit(self, train_frame, validation_frame=None):
+                self.prediction = float(train_frame["price"].mean())
+                return self
+
+            def predict(self, prediction_frame):
+                return np.full(len(prediction_frame), self.prediction)
+
+        with patch.object(
+            model_competition,
+            "_create_adapter",
+            create=True,
+            return_value=NoOpAdapter(),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "manifest must include development, test, and folds",
+            ):
+                evaluate_candidate(frame, manifest, config, seed=42)
+
+    def test_evaluate_candidate_rejects_seed_outside_uint32_range(self):
+        frame, manifest = make_cv_fixture()
+        config = tiny_candidate_configs()[1]
+
+        for invalid_seed in (-1, 2**32):
+            with self.subTest(seed=invalid_seed):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"seed must be an integer between 0 and 2\*\*32 - 1",
+                ):
+                    with patch.object(
+                        model_competition,
+                        "_create_adapter",
+                        create=True,
+                    ):
+                        model_competition.evaluate_candidate(
+                            frame,
+                            manifest,
+                            config,
+                            seed=invalid_seed,
+                        )
+
+    def test_evaluate_candidate_validates_only_development_prices_clearly(self):
+        frame, manifest = make_cv_fixture()
+        frame["price"] = frame["price"].astype(object)
+        frame.loc[manifest["development"][0], "price"] = "not-a-price"
+        frame.loc[manifest["test"], "price"] = "sealed-test-value"
+        config = tiny_candidate_configs()[1]
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "development prices must be a one-dimensional numeric array",
+        ):
+            with patch.object(
+                model_competition,
+                "_create_adapter",
+                create=True,
+            ):
+                model_competition.evaluate_candidate(
+                    frame,
+                    manifest,
+                    config,
+                    seed=42,
+                )
+
+    def test_real_candidate_adapters_fit_predict_and_save_with_tiny_budgets(self):
+        create_adapter = getattr(model_competition, "_create_adapter", None)
+        self.assertIsNotNone(create_adapter)
+        frame, manifest = make_cv_fixture()
+        fold = manifest["folds"][0]
+        train_frame = model_competition._model_frame(
+            frame.loc[fold["train"]],
+            2026,
+        )
+        validation_frame = model_competition._model_frame(
+            frame.loc[fold["validation"]],
+            2026,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for config in tiny_candidate_configs():
+                with self.subTest(model_type=config.model_type):
+                    adapter = create_adapter(config, seed=42)
+                    fitted = adapter.fit(train_frame, validation_frame)
+                    predictions = adapter.predict(
+                        validation_frame.loc[:, MODEL_FEATURES]
+                    )
+                    artifact_dir = root / config.model_type
+                    metadata = adapter.save(artifact_dir)
+
+                    self.assertIs(fitted, adapter)
+                    self.assertEqual(predictions.shape, (len(validation_frame),))
+                    self.assertTrue(np.all(np.isfinite(predictions)))
+                    self.assertTrue(np.all(predictions >= 0))
+                    self.assertEqual(metadata["model_type"], config.model_type)
+                    self.assertEqual(metadata["target_transform"], "log1p")
+                    self.assertTrue(metadata["artifacts"])
+                    for relative_path in metadata["artifacts"].values():
+                        self.assertTrue((artifact_dir / relative_path).is_file())
+                    json.dumps(metadata, allow_nan=False)
+
+    def test_fold_preprocessors_fit_numeric_and_categories_on_train_only(self):
+        create_adapter = getattr(model_competition, "_create_adapter", None)
+        self.assertIsNotNone(create_adapter)
+        frame, manifest = make_cv_fixture()
+        fold = manifest["folds"][0]
+        train_source = frame.loc[fold["train"]].copy()
+        validation_source = frame.loc[fold["validation"]].copy()
+        train_source.loc[fold["train"][0], "mileage"] = np.nan
+        validation_source["mileage"] = 9_999_999.0
+        validation_source["brand"] = "validation-only-brand"
+        expected_median = float(train_source["mileage"].median())
+        train_frame = model_competition._model_frame(train_source, 2026)
+        validation_frame = model_competition._model_frame(validation_source, 2026)
+
+        for config in tiny_candidate_configs()[1:]:
+            with self.subTest(model_type=config.model_type):
+                adapter = create_adapter(config, seed=42)
+                adapter.fit(train_frame, validation_frame)
+                numeric_pipeline = adapter.preprocessor.named_transformers_["numeric"]
+                categorical_pipeline = adapter.preprocessor.named_transformers_[
+                    "categorical"
+                ]
+                encoder = categorical_pipeline.named_steps["one_hot"]
+                brand_index = CATEGORICAL_FEATURES.index("brand")
+
+                self.assertEqual(
+                    numeric_pipeline.named_steps["imputer"].statistics_[0],
+                    expected_median,
+                )
+                self.assertNotIn(
+                    "validation-only-brand",
+                    encoder.categories_[brand_index],
+                )
+
+    def test_catboost_uses_native_categorical_feature_indexes(self):
+        create_adapter = getattr(model_competition, "_create_adapter", None)
+        self.assertIsNotNone(create_adapter)
+        frame, manifest = make_cv_fixture()
+        fold = manifest["folds"][0]
+        train_frame = model_competition._model_frame(frame.loc[fold["train"]], 2026)
+        validation_frame = model_competition._model_frame(
+            frame.loc[fold["validation"]],
+            2026,
+        )
+        adapter = create_adapter(tiny_candidate_configs()[0], seed=42)
+
+        adapter.fit(train_frame, validation_frame)
+
+        self.assertEqual(
+            adapter.model.get_cat_feature_indices(),
+            list(
+                range(
+                    len(MODEL_FEATURES) - len(CATEGORICAL_FEATURES),
+                    len(MODEL_FEATURES),
+                )
+            ),
+        )
+        self.assertIsInstance(adapter.best_iteration, int)
+        self.assertGreaterEqual(adapter.best_iteration, 0)
+
+    def test_mlp_training_is_deterministic_for_fixed_seed(self):
+        create_adapter = getattr(model_competition, "_create_adapter", None)
+        self.assertIsNotNone(create_adapter)
+        frame, manifest = make_cv_fixture()
+        fold = manifest["folds"][0]
+        train_frame = model_competition._model_frame(frame.loc[fold["train"]], 2026)
+        validation_frame = model_competition._model_frame(
+            frame.loc[fold["validation"]],
+            2026,
+        )
+
+        first = create_adapter(tiny_candidate_configs()[2], seed=42)
+        second = create_adapter(tiny_candidate_configs()[2], seed=42)
+        first.fit(train_frame, validation_frame)
+        second.fit(train_frame, validation_frame)
+
+        np.testing.assert_allclose(
+            first.predict(validation_frame.loc[:, MODEL_FEATURES]),
+            second.predict(validation_frame.loc[:, MODEL_FEATURES]),
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(first.best_epoch, second.best_epoch)
+
+    def test_adapter_factory_rejects_invalid_family_params_and_budgets(self):
+        create_adapter = getattr(model_competition, "_create_adapter", None)
+        self.assertIsNotNone(create_adapter)
+        cases = (
+            (
+                CandidateConfig("bad-family", "linear", {}, 0),
+                "unsupported model_type: linear",
+            ),
+            (
+                CandidateConfig(
+                    "bad-cat-loss",
+                    "catboost",
+                    {"loss_function": "MAE"},
+                    0,
+                ),
+                "catboost loss_function must be RMSE",
+            ),
+            (
+                CandidateConfig(
+                    "cat-over-budget",
+                    "catboost",
+                    {"loss_function": "RMSE", "iterations": 1501},
+                    0,
+                ),
+                "catboost iterations must be between 1 and 1500",
+            ),
+            (
+                CandidateConfig(
+                    "mlp-over-budget",
+                    "mlp",
+                    {
+                        "hidden_dims": (8,),
+                        "dropout": 0.0,
+                        "learning_rate": 0.01,
+                        "max_epochs": 401,
+                    },
+                    0,
+                ),
+                "mlp max_epochs must be between 1 and 400",
+            ),
+            (
+                CandidateConfig(
+                    "unknown-param",
+                    "extra_trees",
+                    {"n_estimators": 5, "not_a_parameter": True},
+                    0,
+                ),
+                "unsupported extra_trees parameters: not_a_parameter",
+            ),
+        )
+
+        for config, message in cases:
+            with self.subTest(name=config.name):
+                with self.assertRaisesRegex(ValueError, message):
+                    create_adapter(config, seed=42)
+
+    def test_legacy_training_script_reuses_canonical_mlp(self):
+        from scripts import train_model
+
+        canonical_model = getattr(model_competition, "MLPRegressor", None)
+        canonical_trainer = getattr(model_competition, "fit_mlp_network", None)
+        self.assertIsNotNone(canonical_model)
+        self.assertIsNotNone(canonical_trainer)
+        self.assertIs(train_model.MLPRegressor, canonical_model)
+        self.assertIs(train_model.fit_mlp_network, canonical_trainer)
 
     def test_checked_in_search_space_mappings_are_immutable(self):
         for configs in (CATBOOST_CONFIGS, EXTRA_TREES_CONFIGS, MLP_CONFIGS):

@@ -1,7 +1,6 @@
 """Train and publish the deterministic vehicle valuation artifact."""
 
 import argparse
-import copy
 import json
 import os
 import shutil
@@ -20,9 +19,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from torch import nn
 
 from services.dataset_contract import REQUIRED_DATASET_COLUMNS, load_dataset
+from services.model_competition import MLPRegressor, fit_mlp_network
 
 
 SEED = 42
@@ -46,23 +45,6 @@ DEFAULT_PROCESSED_DATASET = (
     Path(__file__).resolve().parents[1] / "data" / "processed" / "normalized_training.csv"
 )
 SOURCE_URL = "https://raw.githubusercontent.com/chandanverma07/DataSets/master/car%20details%20v4.csv"
-
-
-class MLPRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dims=(128, 64), dropout=0.0):
-        super().__init__()
-        layers = []
-        previous = input_dim
-        for hidden_dim in hidden_dims:
-            layers.extend([nn.Linear(previous, hidden_dim), nn.ReLU()])
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            previous = hidden_dim
-        layers.append(nn.Linear(previous, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, features):
-        return self.net(features)
 
 
 def split_dataset(frame: pd.DataFrame, seed: int = SEED):
@@ -179,41 +161,18 @@ def _tensor(values: np.ndarray) -> torch.Tensor:
 
 
 def _fit_mlp(X_train, y_train, X_validation, y_validation, seed: int):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    model = MLPRegressor(X_train.shape[1], hidden_dims=(128, 64), dropout=0.0)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    loss_function = nn.MSELoss()
-    train_features = _tensor(X_train)
-    train_targets = _tensor(y_train).reshape(-1, 1)
-    validation_features = _tensor(X_validation)
-    validation_targets = _tensor(y_validation).reshape(-1, 1)
-    best_state = copy.deepcopy(model.state_dict())
-    best_validation_loss = float("inf")
-    patience = 35
-    stale_epochs = 0
-
-    for _ in range(300):
-        model.train()
-        optimizer.zero_grad()
-        loss = loss_function(model(train_features), train_targets)
-        loss.backward()
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            validation_loss = loss_function(model(validation_features), validation_targets).item()
-        if validation_loss < best_validation_loss:
-            best_validation_loss = validation_loss
-            best_state = copy.deepcopy(model.state_dict())
-            stale_epochs = 0
-        else:
-            stale_epochs += 1
-        if stale_epochs >= patience:
-            break
-
-    model.load_state_dict(best_state)
-    model.eval()
+    model, best_validation_loss, _ = fit_mlp_network(
+        X_train,
+        y_train,
+        X_validation,
+        y_validation,
+        hidden_dims=(128, 64),
+        dropout=0.0,
+        learning_rate=0.001,
+        max_epochs=300,
+        patience=35,
+        seed=seed,
+    )
     return model, best_validation_loss ** 0.5
 
 
