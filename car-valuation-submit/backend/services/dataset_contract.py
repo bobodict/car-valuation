@@ -1,5 +1,7 @@
+from datetime import date
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -34,4 +36,25 @@ def load_dataset(path: str | Path) -> pd.DataFrame:
     missing = validate_dataset_columns(frame.columns)
     if missing:
         raise ValueError(f"数据集缺少必要字段：{', '.join(missing)}")
+    return validate_normalized_frame(frame)
+
+
+def validate_normalized_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Validate the normalized training contract without imputing values."""
+    missing = validate_dataset_columns(frame.columns)
+    if missing:
+        raise ValueError(f"dataset missing normalized columns: {', '.join(missing)}")
+
+    price = pd.to_numeric(frame["price"], errors="coerce")
+    mileage = pd.to_numeric(frame["mileage"], errors="coerce")
+    year = pd.to_numeric(frame["year"], errors="coerce")
+    current_year = date.today().year
+
+    if price.isna().any() or (price <= 0).any():
+        raise ValueError("price must contain only positive numeric values")
+    if mileage.isna().any() or (mileage < 0).any():
+        raise ValueError("mileage must contain only non-negative numeric values")
+    if year.isna().any() or (year < 1980).any() or (year > current_year).any():
+        raise ValueError("year must be between 1980 and the current year")
+
     return frame
