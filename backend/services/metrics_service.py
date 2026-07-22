@@ -21,7 +21,11 @@ def load_metrics() -> dict:
         data_source=artifact.get("data_source", {}),
         model_version=artifact.get("model_version", "unknown"),
         model_type=artifact.get("model_type", "mlp"),
-        feature_version=artifact.get("feature_version", "2.0.0"),
+        feature_version=(
+            artifact["feature_version"]
+            if "feature_version" in artifact
+            else artifact.get("artifact_version", "2.0.0")
+        ),
         sample_count=artifact.get("sample_count", 0),
         warnings=artifact.get("warnings", []),
     )

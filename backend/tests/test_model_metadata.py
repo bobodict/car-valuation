@@ -6,10 +6,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from main import get_metrics, model_card, model_health
-from schemas import MetricsResponse, ModelCardResponse, ModelHealthResponse
+from schemas import (
+    MetricsResponse,
+    ModelCardResponse,
+    ModelHealthResponse,
+    PredictRequest,
+    PredictResponse,
+)
 from services import metrics_service
 from services.model_metadata import load_model_card
 from services.model_quality_service import get_model_health
+from services.model_service import call_model_api
 
 
 def make_card(split=None, **overrides):
@@ -148,6 +155,46 @@ class ModelMetadataTests(unittest.TestCase):
         self.assertEqual(result["leaderboard"], {"winner": "catboost"})
         self.assertEqual(result["error_analysis"], {"worst_segment": "rare"})
 
+    def test_v3_model_card_accepts_current_train_validation_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model_card.json"
+            path.write_text(
+                json.dumps(
+                    make_card(
+                        split={
+                            "train": 7,
+                            "validation": 1,
+                            "development": 8,
+                            "test": 2,
+                        },
+                        artifact_version="3.0.0",
+                        feature_version="3.0.0",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            result = load_model_card(path)
+
+        self.assertEqual(result["split"]["development"], 8)
+
+    def test_model_card_rejects_v3_split_without_folds_or_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model_card.json"
+            path.write_text(
+                json.dumps(
+                    make_card(
+                        split={"development": 8, "test": 2},
+                        artifact_version="3.0.0",
+                        feature_version="3.0.0",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "split"):
+                load_model_card(path)
+
     def test_model_card_embedded_evidence_takes_precedence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -190,8 +237,12 @@ class ModelMetadataTests(unittest.TestCase):
             for artifact, expected in (
                 (make_metrics(), ("mlp", "2.0.0")),
                 (
-                    make_metrics(model_type="extra_trees", feature_version="3.0.0"),
-                    ("extra_trees", "3.0.0"),
+                    make_metrics(
+                        artifact_version="3.0.0",
+                        feature_version="3.1.0",
+                        model_type="extra_trees",
+                    ),
+                    ("extra_trees", "3.1.0"),
                 ),
             ):
                 with self.subTest(expected=expected):
@@ -209,6 +260,57 @@ class ModelMetadataTests(unittest.TestCase):
                     response = MetricsResponse.model_validate(result).model_dump()
                     self.assertEqual(response["model_type"], expected[0])
             metrics_service.load_metrics.cache_clear()
+
+    def test_artifact_version_only_v3_metrics_flow_to_health_and_prediction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.json"
+            path.write_text(
+                json.dumps(
+                    make_metrics(
+                        artifact_version="3.0.0",
+                        model_type="catboost",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with patch.object(
+                    metrics_service,
+                    "settings",
+                    SimpleNamespace(metrics_path=path),
+                ):
+                    metrics = metrics_service.load_metrics()
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        with patch(
+            "services.model_quality_service.load_metrics", return_value=metrics
+        ):
+            health = get_model_health()
+        with (
+            patch("services.model_service.load_metrics", return_value=metrics),
+            patch("services.model_service.predict_price_one", return_value=505000.0),
+        ):
+            prediction = call_model_api(
+                PredictRequest(
+                    brand="Honda",
+                    city="Pune",
+                    mileage=10000,
+                    year=2020,
+                    month=1,
+                )
+            )
+
+        self.assertEqual(
+            MetricsResponse.model_validate(metrics).feature_version, "3.0.0"
+        )
+        self.assertEqual(
+            ModelHealthResponse.model_validate(health).feature_version, "3.0.0"
+        )
+        self.assertEqual(
+            PredictResponse.model_validate(prediction).feature_version, "3.0.0"
+        )
 
     def test_model_card_requires_currency_and_positive_sample_count(self):
         with tempfile.TemporaryDirectory() as directory:

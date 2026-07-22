@@ -73,10 +73,15 @@ def load_model_card(path: str | Path | None = None) -> dict:
     if not isinstance(card["split"], dict):
         raise ValueError("model card split must be an object")
     legacy_split = {"train", "validation", "test"}.issubset(card["split"])
-    v3_split = {"development", "test"}.issubset(card["split"])
+    v3_fold_split = {"development", "test", "folds"}.issubset(card["split"])
+    v3_count_split = {"train", "validation", "development", "test"}.issubset(
+        card["split"]
+    )
+    v3_split = v3_fold_split or v3_count_split
     if not legacy_split and not v3_split:
         raise ValueError(
-            "model card split must include train/validation/test or development/test"
+            "model card split must include train/validation/test, "
+            "development/test/folds, or train/validation/development/test"
         )
     if not isinstance(card["thresholds"], dict):
         raise ValueError("model card thresholds must be an object")

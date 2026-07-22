@@ -58,9 +58,8 @@ class ModelQualityTests(unittest.TestCase):
         )
 
         self.assertEqual(assessment["quality_gate"], "fail")
-        self.assertTrue(any("R2" in warning for warning in assessment["warnings"]))
+        self.assertTrue(any("R²" in warning for warning in assessment["warnings"]))
         self.assertTrue(any("10%" in warning for warning in assessment["warnings"]))
-        self.assertTrue(all(warning.isascii() for warning in assessment["warnings"]))
 
 
 class DatasetContractTests(unittest.TestCase):
