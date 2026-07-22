@@ -1,7 +1,11 @@
 import inspect
 import json
+import os
+import subprocess
 import tempfile
+import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -147,12 +151,6 @@ def make_fixture_experiment():
             "warnings": [],
             "thresholds": {"min_r2": 0.0, "min_acc_10": 0.5},
         },
-        "error_analysis": {
-            "development_mean_baseline": float(frame.loc[range(8), "price"].mean()),
-            "price_quartiles": {"groups": []},
-            "model_family_frequency": {"groups": []},
-            "full_model_seen_status": {"groups": []},
-        },
         "seed": 42,
         "collection_year": 2026,
         "provenance": {"source_id": "unit-test"},
@@ -160,36 +158,33 @@ def make_fixture_experiment():
 
 
 def write_publishable_experiment(root, quality_gate="pass", artifact_path="winner.bin"):
-    root.mkdir()
-    (root / "winner.bin").write_bytes(b"winner-model")
-    manifest = {
-        "artifact_version": "3.0.0",
-        "model_type": "extra_trees",
-        "model_artifacts": {"bundle": artifact_path},
-    }
-    metrics = {
-        "artifact_version": "3.0.0",
-        "quality_gate": quality_gate,
-        "thresholds": {"min_r2": 0.0, "min_acc_10": 0.5},
-        "test_metrics": {
-            "r2": 0.8,
-            "acc_10": 0.75,
-            "rmse": 10.0,
-            "baseline_rmse": 25.0,
-        },
-    }
-    payloads = {
-        "model_manifest.json": manifest,
-        "feature_config.json": {"artifact_version": "3.0.0"},
-        "metrics.json": metrics,
-        "leaderboard.json": {"artifact_version": "3.0.0", "candidates": []},
-        "error_analysis.json": {"artifact_version": "3.0.0"},
-        "model_card.json": {"artifact_version": "3.0.0"},
-    }
-    for name, payload in payloads.items():
-        (root / name).write_text(
-            json.dumps(payload, allow_nan=False), encoding="utf-8"
+    train_model.build_artifacts(make_fixture_experiment(), root)
+    if quality_gate != "pass":
+        metrics_path = root / "metrics.json"
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        metrics["quality_gate"] = quality_gate
+        metrics_path.write_text(json.dumps(metrics, allow_nan=False), encoding="utf-8")
+    if artifact_path != "winner.bin":
+        manifest_path = root / "model_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["model_artifacts"]["bundle"] = artifact_path
+        manifest["model_artifact_metadata"]["artifacts"]["bundle"] = artifact_path
+        manifest_path.write_text(
+            json.dumps(manifest, allow_nan=False), encoding="utf-8"
         )
+
+
+def mark_owned_model_directory(path):
+    (path / ".model-publication-owner.json").write_text(
+        json.dumps(
+            {
+                "owner": "car-valuation-model-publication",
+                "sentinel_version": 1,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
 
 
 class TrainingPipelineTests(unittest.TestCase):
@@ -273,6 +268,164 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertEqual(response.model_version, "v3-run-fixture")
             self.assertIn("cv_selection", card)
             self.assertIn("independent_holdout", card)
+
+    def test_experiment_validation_rejects_cross_report_disagreement(self):
+        validate_experiment = self.require_function("_validate_experiment_directory")
+
+        def add_better_ranked_candidate(payload):
+            better = candidate_result("better-tree")
+            better["cv"].update(
+                acc_10_mean=0.99,
+                median_ape_mean=0.01,
+                r2_mean=0.99,
+            )
+            payload["candidates"].append(better)
+            payload["candidate_count"] = len(payload["candidates"])
+
+        mutations = {
+            "feature version": (
+                "feature_config.json",
+                lambda payload: payload.update(feature_version="wrong"),
+            ),
+            "model version": (
+                "metrics.json",
+                lambda payload: payload.update(model_version="wrong"),
+            ),
+            "model type": (
+                "metrics.json",
+                lambda payload: payload.update(model_type="mlp"),
+            ),
+            "winner": (
+                "leaderboard.json",
+                lambda payload: payload.update(winner="not-the-winner"),
+            ),
+            "split indices": (
+                "metrics.json",
+                lambda payload: payload["split_indices"].update(test=[7]),
+            ),
+            "holdout metrics": (
+                "model_card.json",
+                lambda payload: payload["test_metrics"].update(rmse=999.0),
+            ),
+            "development baseline": (
+                "error_analysis.json",
+                lambda payload: payload.update(development_mean_baseline=999.0),
+            ),
+            "baseline evidence": (
+                "metrics.json",
+                lambda payload: payload["baseline_evidence"].update(
+                    value_inr=999.0
+                ),
+            ),
+            "nested error evidence": (
+                "model_card.json",
+                lambda payload: payload["error_analysis"].update(
+                    development_mean_baseline=999.0
+                ),
+            ),
+            "leaderboard scope": (
+                "leaderboard.json",
+                lambda payload: payload.update(selection_scope="outer_test"),
+            ),
+            "leaderboard rank": (
+                "leaderboard.json",
+                add_better_ranked_candidate,
+            ),
+            "artifact roles": (
+                "model_manifest.json",
+                lambda payload: payload["model_artifacts"].update(model="winner.bin"),
+            ),
+        }
+        for label, (filename, mutate) in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory) / "experiment"
+                train_model.build_artifacts(make_fixture_experiment(), output_dir)
+                artifact_path = output_dir / filename
+                payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                mutate(payload)
+                artifact_path.write_text(
+                    json.dumps(payload, allow_nan=False), encoding="utf-8"
+                )
+
+                with self.assertRaises((TypeError, ValueError)):
+                    validate_experiment(output_dir)
+
+    def test_experiment_validation_recalculates_and_verifies_quality_gate(self):
+        validate_experiment = self.require_function("_validate_experiment_directory")
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "experiment"
+            train_model.build_artifacts(make_fixture_experiment(), output_dir)
+            metrics_path = output_dir / "metrics.json"
+            card_path = output_dir / "model_card.json"
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            card = json.loads(card_path.read_text(encoding="utf-8"))
+            metrics["test_metrics"]["acc_10"] = 0.1
+            card["test_metrics"]["acc_10"] = 0.1
+            card["independent_holdout"]["metrics"]["acc_10"] = 0.1
+            metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+            card_path.write_text(json.dumps(card), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "quality gate|gate"):
+                validate_experiment(output_dir)
+
+    def test_builtin_smoke_loader_rejects_unusable_family_artifacts(self):
+        load_saved = self.require_function("_load_saved_model_for_smoke")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model.bin").write_bytes(b"invalid")
+            catboost = Mock(tree_count_=0)
+            with patch.object(train_model, "CatBoostRegressor", return_value=catboost):
+                with self.assertRaisesRegex(ValueError, "CatBoost|fitted|tree"):
+                    load_saved(
+                        root,
+                        {
+                            "model_type": "catboost",
+                            "model_artifacts": {"model": "model.bin"},
+                        },
+                    )
+
+            with patch.object(
+                train_model.joblib,
+                "load",
+                return_value={"preprocessor": object(), "model": object()},
+            ):
+                with self.assertRaisesRegex(ValueError, "ExtraTrees|fitted|bundle"):
+                    load_saved(
+                        root,
+                        {
+                            "model_type": "extra_trees",
+                            "model_artifacts": {"bundle": "model.bin"},
+                        },
+                    )
+
+            (root / "preprocessor.bin").write_bytes(b"invalid")
+            with (
+                patch.object(train_model.joblib, "load", return_value=object()),
+                patch.object(train_model.torch, "load", return_value={}),
+            ):
+                with self.assertRaisesRegex(ValueError, "MLP|checkpoint|fitted"):
+                    load_saved(
+                        root,
+                        {
+                            "model_type": "mlp",
+                            "model_artifacts": {
+                                "preprocessor": "preprocessor.bin",
+                                "model": "model.bin",
+                            },
+                        },
+                    )
+
+    def test_artifact_builder_refuses_preexisting_uninitialized_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "run"
+            output_dir.mkdir()
+            marker = output_dir / "user-marker.bin"
+            marker.write_bytes(b"do-not-overwrite")
+
+            with self.assertRaises(FileExistsError):
+                train_model.build_artifacts(make_fixture_experiment(), output_dir)
+
+            self.assertEqual(marker.read_bytes(), b"do-not-overwrite")
 
     def test_quality_gate_is_fixed_strict_and_rejects_nonfinite_metrics(self):
         passing = train_model.assess_quality_gate(
@@ -577,6 +730,31 @@ class TrainingPipelineTests(unittest.TestCase):
         self.assertIsNone(validation_frame)
         self.assertEqual(result.strategy, "full_development")
 
+    def test_refit_rejects_duplicate_or_noninteger_development_index(self):
+        refit_winner = self.require_function("refit_winner")
+        invalid_indices = (
+            [1, 1, 2, 3],
+            [True, 1, 2, 3],
+            [0.0, 1.0, 2.0, 3.0],
+            ["0", "1", "2", "3"],
+        )
+        for values in invalid_indices:
+            with self.subTest(index=values):
+                development = make_fixture_frame(4)
+                development.index = pd.Index(values)
+                factory = Mock()
+
+                with self.assertRaises((TypeError, ValueError)):
+                    refit_winner(
+                        development,
+                        candidate_result(),
+                        seed=42,
+                        collection_year=2026,
+                        adapter_factory=factory,
+                    )
+
+                factory.assert_not_called()
+
     def test_error_analysis_uses_development_only_group_definitions_and_nulls(self):
         build_error_analysis = self.require_function("build_error_analysis")
         development = make_fixture_frame(3)
@@ -616,6 +794,59 @@ class TrainingPipelineTests(unittest.TestCase):
         singleton = next(group for group in seen["groups"] if group["count"] == 1)
         self.assertIsNone(singleton["metrics"]["r2"])
         json.dumps(report, allow_nan=False)
+
+    def test_price_quartile_boundaries_are_development_derived_and_stable(self):
+        development = make_fixture_frame(12)
+        development["price"] = [100.0] * 4 + [200.0] * 4 + [400.0] * 4
+        first_holdout = make_fixture_frame(4)
+        first_holdout["price"] = [50.0, 150.0, 300.0, 800.0]
+        second_holdout = first_holdout.copy()
+        second_holdout["price"] = [1.0, 2.0, 3.0, 4.0]
+
+        first = train_model.build_error_analysis(
+            development,
+            first_holdout,
+            first_holdout["price"].to_numpy(),
+            float(development["price"].mean()),
+        )
+        second = train_model.build_error_analysis(
+            development,
+            second_holdout,
+            second_holdout["price"].to_numpy(),
+            float(development["price"].mean()),
+        )
+
+        first_quartiles = first["price_quartiles"]
+        second_quartiles = second["price_quartiles"]
+        self.assertEqual(first_quartiles["definition_source"], "development_only")
+        self.assertEqual(
+            first_quartiles["boundaries_inr"],
+            second_quartiles["boundaries_inr"],
+        )
+        self.assertEqual(len(first_quartiles["boundaries_inr"]), 3)
+        self.assertEqual(len(first_quartiles["groups"]), 4)
+        json.dumps(first, allow_nan=False)
+
+    def test_singleton_metrics_share_canonical_nextafter_accuracy_boundaries(self):
+        singleton_metrics = self.require_function("_single_or_multi_metrics")
+        actual = np.array([100.0])
+        for threshold, field in ((0.10, "acc_10"), (0.20, "acc_20")):
+            for factor in (
+                np.nextafter(1.0 + threshold, np.inf),
+                np.nextafter(np.nextafter(1.0 + threshold, np.inf), np.inf),
+            ):
+                with self.subTest(threshold=threshold, factor=factor):
+                    predicted = actual * factor
+                    canonical = train_model.calculate_metrics(
+                        np.repeat(actual, 2),
+                        np.repeat(predicted, 2),
+                        np.repeat(actual, 2),
+                    )
+                    singleton = singleton_metrics(actual, predicted, 100.0)
+
+                    self.assertEqual(singleton[field], canonical[field])
+                    self.assertIsNone(singleton["r2"])
+                    self.assertIsNone(singleton["baseline_r2"])
 
     def test_train_and_publish_uses_fixed_orchestration_order_and_one_holdout(self):
         train_and_publish = self.require_function("train_and_publish")
@@ -680,7 +911,6 @@ class TrainingPipelineTests(unittest.TestCase):
                     train_model.SOURCE_URL,
                 )
                 self.assertEqual(experiment["provenance"]["sha256"], "fixture-sha")
-                output_dir.mkdir(parents=True)
                 return []
 
             def smoke(output_dir, loader=None):
@@ -723,6 +953,91 @@ class TrainingPipelineTests(unittest.TestCase):
         self.assertEqual(evaluate_mock.call_count, 1)
         self.assertTrue(result["published"])
 
+    def test_stage_failures_retain_audit_directory_and_preserve_formal_model(self):
+        train_and_publish = self.require_function("train_and_publish")
+        frame = make_fixture_frame(12)
+        manifest = {
+            "development": list(range(10)),
+            "test": [10, 11],
+            "folds": [],
+        }
+        holdout = {
+            "metrics": {
+                "r2": 0.5,
+                "acc_10": 0.8,
+                "rmse": 1.0,
+                "baseline_rmse": 2.0,
+            }
+        }
+        gate = {
+            "quality_gate": "pass",
+            "warnings": [],
+            "thresholds": train_model.QUALITY_THRESHOLDS,
+        }
+        failure_points = {
+            "build_split_manifest": "build_split_manifest",
+            "run_competition": "run_competition",
+            "write_experiment_artifacts": "write_experiment_artifacts",
+            "publish_experiment": "publish_experiment",
+        }
+
+        for expected_stage, failing_name in failure_points.items():
+            with self.subTest(stage=expected_stage), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                formal = root / "models"
+                formal.mkdir()
+                marker = formal / "marker.bin"
+                marker.write_bytes(b"formal-before")
+                run_id = f"run-{expected_stage}"
+                experiment_dir = root / "experiments" / run_id
+
+                def write_artifacts(experiment, output_dir):
+                    (output_dir / "artifact-marker.bin").write_bytes(b"partial")
+                    return []
+
+                patches = {
+                    "load_dataset": Mock(return_value=frame),
+                    "build_split_manifest": Mock(return_value=manifest),
+                    "run_competition": Mock(return_value=[candidate_result()]),
+                    "select_winner": Mock(return_value=candidate_result()),
+                    "refit_winner": Mock(return_value=object()),
+                    "evaluate_holdout": Mock(return_value=holdout),
+                    "assess_quality_gate": Mock(return_value=gate),
+                    "write_experiment_artifacts": Mock(side_effect=write_artifacts),
+                    "smoke_load_experiment": Mock(return_value=True),
+                    "publish_experiment": Mock(return_value=True),
+                }
+                patches[failing_name] = Mock(
+                    side_effect=RuntimeError(f"failed at {expected_stage}")
+                )
+
+                with ExitStack() as stack:
+                    for name, mocked in patches.items():
+                        stack.enter_context(patch.object(train_model, name, mocked))
+                    stack.enter_context(
+                        patch.object(train_model, "_new_run_id", return_value=run_id)
+                    )
+                    with self.assertRaisesRegex(RuntimeError, expected_stage):
+                        train_and_publish(
+                            "fixture.csv",
+                            models_dir=formal,
+                            experiments_dir=root / "experiments",
+                            collection_year=2026,
+                            candidates=(object(),),
+                        )
+
+                self.assertTrue(experiment_dir.is_dir())
+                failure = json.loads(
+                    (experiment_dir / "failure.json").read_text(encoding="utf-8"),
+                    parse_constant=lambda value: self.fail(
+                        f"non-strict failure JSON constant: {value}"
+                    ),
+                )
+                self.assertEqual(failure["stage"], expected_stage)
+                self.assertEqual(failure["error_type"], "RuntimeError")
+                self.assertIn(expected_stage, failure["message"])
+                self.assertEqual(marker.read_bytes(), b"formal-before")
+
     def test_smoke_failure_preserves_formal_directory_and_experiment(self):
         train_and_publish = self.require_function("train_and_publish")
         with tempfile.TemporaryDirectory() as directory:
@@ -734,7 +1049,6 @@ class TrainingPipelineTests(unittest.TestCase):
             experiment_dir = root / "experiments" / "run"
 
             def write(experiment, output_dir):
-                output_dir.mkdir(parents=True)
                 (output_dir / "audit.txt").write_text("kept", encoding="utf-8")
                 return []
 
@@ -781,6 +1095,10 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertEqual(result["smoke_status"], "fail")
             self.assertEqual(marker.read_bytes(), b"formal-before")
             self.assertEqual((experiment_dir / "audit.txt").read_text(encoding="utf-8"), "kept")
+            failure = json.loads(
+                (experiment_dir / "failure.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failure["stage"], "smoke_load_experiment")
             publish.assert_not_called()
 
     def test_failed_gate_returns_false_and_preserves_marker_byte_for_byte(self):
@@ -809,6 +1127,7 @@ class TrainingPipelineTests(unittest.TestCase):
             formal = root / "models"
             formal.mkdir()
             (formal / "old.bin").write_bytes(b"old")
+            mark_owned_model_directory(formal)
             write_publishable_experiment(experiment)
 
             published = publish_experiment(experiment, formal)
@@ -828,6 +1147,7 @@ class TrainingPipelineTests(unittest.TestCase):
             formal.mkdir()
             marker = formal / "marker.bin"
             marker.write_bytes(b"formal-before")
+            mark_owned_model_directory(formal)
             write_publishable_experiment(experiment, artifact_path="../outside.bin")
             (root / "outside.bin").write_bytes(b"outside")
 
@@ -903,6 +1223,7 @@ class TrainingPipelineTests(unittest.TestCase):
             formal.mkdir()
             marker = formal / "marker.bin"
             marker.write_bytes(b"formal-before")
+            mark_owned_model_directory(formal)
             write_publishable_experiment(experiment)
             metrics_path = experiment / "metrics.json"
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -924,6 +1245,7 @@ class TrainingPipelineTests(unittest.TestCase):
             formal.mkdir()
             marker = formal / "marker.bin"
             marker.write_bytes(b"formal-before")
+            mark_owned_model_directory(formal)
             write_publishable_experiment(experiment)
 
             def fail_staging_swap(source, target):
@@ -950,6 +1272,7 @@ class TrainingPipelineTests(unittest.TestCase):
             formal.mkdir()
             marker = formal / "marker.bin"
             marker.write_bytes(b"formal-before")
+            mark_owned_model_directory(formal)
             write_publishable_experiment(experiment)
 
             def fail_staging_validation(path):
@@ -968,6 +1291,221 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertEqual(marker.read_bytes(), b"formal-before")
             self.assertEqual(list(root.glob(".models.staging-*")), [])
             self.assertEqual(list(root.glob(".models.backup-*")), [])
+
+    def test_publication_rejects_protected_and_broad_targets_before_mutation(self):
+        publish_experiment = self.require_function("publish_experiment")
+        source_path = Path(train_model.__file__).resolve()
+        backend_root = source_path.parents[1]
+        project_root = source_path.parents[2]
+        targets = {
+            "home": Path.home().resolve(),
+            "filesystem anchor": Path(project_root.anchor).resolve(),
+            "backend root": backend_root,
+            "project root": project_root,
+            "worktree container": project_root.parent,
+            "workspace repository root": project_root.parents[1],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            write_publishable_experiment(experiment)
+            for label, target in targets.items():
+                with self.subTest(target=label):
+                    with (
+                        patch.object(
+                            train_model.shutil,
+                            "copytree",
+                            side_effect=AssertionError("copy must not be attempted"),
+                        ) as copytree,
+                        patch.object(
+                            train_model,
+                            "_rename_directory",
+                            side_effect=AssertionError("rename must not be attempted"),
+                        ) as rename,
+                        patch.object(
+                            train_model.shutil,
+                            "rmtree",
+                            side_effect=AssertionError("delete must not be attempted"),
+                        ) as rmtree,
+                    ):
+                        with self.assertRaisesRegex(ValueError, "protected|model directory"):
+                            publish_experiment(experiment, target)
+                        copytree.assert_not_called()
+                        rename.assert_not_called()
+                        rmtree.assert_not_called()
+
+            broad = root / "uploads"
+            broad.mkdir()
+            marker = broad / "user-content.bin"
+            marker.write_bytes(b"preserve-user-content")
+            with self.assertRaisesRegex(ValueError, "owned|model directory"):
+                publish_experiment(experiment, broad)
+            self.assertEqual(marker.read_bytes(), b"preserve-user-content")
+            self.assertEqual(list(root.glob(".uploads.staging-*")), [])
+            self.assertEqual(list(root.glob(".uploads.backup-*")), [])
+            self.assertFalse((root / ".uploads.publish.lock").exists())
+
+    def test_publication_rejects_symlink_resolving_to_protected_directory(self):
+        publish_experiment = self.require_function("publish_experiment")
+        backend_root = Path(train_model.__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            link = root / "models-link"
+            write_publishable_experiment(experiment)
+            try:
+                os.symlink(backend_root, link, target_is_directory=True)
+            except OSError as exc:
+                if os.name != "nt":
+                    self.skipTest(f"directory symlinks are unavailable: {exc}")
+                junction = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(backend_root)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if junction.returncode != 0:
+                    self.skipTest(
+                        f"directory links are unavailable: {junction.stderr or exc}"
+                    )
+
+            try:
+                with (
+                    patch.object(train_model.shutil, "copytree") as copytree,
+                    patch.object(train_model, "_rename_directory") as rename,
+                    patch.object(train_model.shutil, "rmtree") as rmtree,
+                ):
+                    with self.assertRaisesRegex(ValueError, "protected|model directory"):
+                        publish_experiment(experiment, link)
+                copytree.assert_not_called()
+                rename.assert_not_called()
+                rmtree.assert_not_called()
+            finally:
+                if link.exists():
+                    os.rmdir(link)
+
+    def test_first_publication_installs_ownership_sentinel_for_future_updates(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            formal = root / "models"
+            write_publishable_experiment(first)
+            write_publishable_experiment(second)
+
+            self.assertTrue(publish_experiment(first, formal))
+            sentinel = formal / ".model-publication-owner.json"
+            self.assertTrue(sentinel.is_file())
+            self.assertTrue(publish_experiment(second, formal))
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(list(root.glob(".models.staging-*")), [])
+            self.assertEqual(list(root.glob(".models.backup-*")), [])
+            self.assertFalse((root / ".models.publish.lock").exists())
+
+    def test_publication_rejects_file_target_before_mutation(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            formal = root / "models"
+            write_publishable_experiment(experiment)
+            formal.write_bytes(b"not-a-directory")
+
+            with (
+                patch.object(train_model.shutil, "copytree") as copytree,
+                patch.object(train_model, "_rename_directory") as rename,
+                patch.object(train_model.shutil, "rmtree") as rmtree,
+            ):
+                with self.assertRaisesRegex(ValueError, "directory|file"):
+                    publish_experiment(experiment, formal)
+            copytree.assert_not_called()
+            rename.assert_not_called()
+            rmtree.assert_not_called()
+            self.assertEqual(formal.read_bytes(), b"not-a-directory")
+
+    def test_concurrent_publisher_fails_before_mutation_and_releases_lock(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            formal = root / "models"
+            write_publishable_experiment(first)
+            write_publishable_experiment(second)
+            entered_copy = threading.Event()
+            release_copy = threading.Event()
+            real_copytree = train_model.shutil.copytree
+            outcome = {}
+
+            def blocking_copytree(source, target, *args, **kwargs):
+                if threading.current_thread().name == "first-publisher":
+                    entered_copy.set()
+                    if not release_copy.wait(timeout=5):
+                        raise TimeoutError("test did not release first publisher")
+                return real_copytree(source, target, *args, **kwargs)
+
+            def publish_first():
+                try:
+                    outcome["result"] = publish_experiment(first, formal)
+                except Exception as exc:
+                    outcome["error"] = exc
+
+            with patch.object(train_model.shutil, "copytree", side_effect=blocking_copytree):
+                worker = threading.Thread(target=publish_first, name="first-publisher")
+                worker.start()
+                self.assertTrue(entered_copy.wait(timeout=5))
+                try:
+                    with self.assertRaisesRegex(FileExistsError, "publication|lock"):
+                        publish_experiment(second, formal)
+                finally:
+                    release_copy.set()
+                    worker.join(timeout=5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn("error", outcome)
+            self.assertTrue(outcome.get("result"))
+            self.assertTrue((formal / "winner.bin").is_file())
+            self.assertTrue((formal / ".model-publication-owner.json").is_file())
+            self.assertEqual(list(root.glob(".models.staging-*")), [])
+            self.assertEqual(list(root.glob(".models.backup-*")), [])
+            self.assertFalse((root / ".models.publish.lock").exists())
+
+    def test_post_swap_backup_cleanup_failure_keeps_success_and_recovery_copy(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            formal = root / "models"
+            write_publishable_experiment(first)
+            write_publishable_experiment(second)
+            self.assertTrue(publish_experiment(first, formal))
+            (formal / "old-marker.bin").write_bytes(b"recoverable-old-model")
+            real_rmtree = train_model.shutil.rmtree
+
+            def fail_backup_cleanup(path, *args, **kwargs):
+                if ".backup-" in Path(path).name:
+                    raise OSError("simulated backup cleanup failure")
+                return real_rmtree(path, *args, **kwargs)
+
+            with patch.object(
+                train_model.shutil,
+                "rmtree",
+                side_effect=fail_backup_cleanup,
+            ):
+                published = publish_experiment(second, formal)
+
+            self.assertTrue(published)
+            self.assertFalse((formal / "old-marker.bin").exists())
+            backups = list(root.glob(".models.backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                (backups[0] / "old-marker.bin").read_bytes(),
+                b"recoverable-old-model",
+            )
+            self.assertEqual(list(root.glob(".models.staging-*")), [])
+            self.assertFalse((root / ".models.publish.lock").exists())
 
     def test_failed_publish_override_is_removed_from_api_and_cli(self):
         self.assertNotIn("allow_failed_publish", inspect.signature(train_model.train_and_publish).parameters)

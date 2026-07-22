@@ -20,6 +20,8 @@ def write_v3_artifacts(models_dir, test_indices=(2, 3), baseline=150.0):
     metrics = {
         "artifact_version": "3.0.0",
         "model_version": "v3-fixture",
+        "model_type": "extra_trees",
+        "split_indices": {"development": [0, 1], "test": list(test_indices)},
         "development_mean_baseline": baseline,
     }
     (models_dir / "model_manifest.json").write_text(
@@ -66,6 +68,68 @@ class EvaluationContractTests(unittest.TestCase):
         self.assertEqual(result["count"], 2)
         expected_baseline_rmse = float(np.sqrt(np.mean((np.array([300.0, 400.0]) - 123.0) ** 2)))
         self.assertAlmostEqual(result["metrics"]["baseline_rmse"], expected_baseline_rmse)
+        for field, value in result["metrics"].items():
+            self.assertEqual(result[field], value)
+
+    def test_v3_artifact_disagreement_is_rejected_before_runtime_loading(self):
+        frame = pd.DataFrame(
+            {
+                "price": [100.0, 200.0, 300.0, 400.0],
+                "model": ["A", "B", "C", "D"],
+            }
+        )
+        mutations = {
+            "artifact version": lambda metrics: metrics.update(
+                artifact_version="3.1.0"
+            ),
+            "model version": lambda metrics: metrics.update(model_version="wrong"),
+            "model type": lambda metrics: metrics.update(model_type="mlp"),
+            "split indices": lambda metrics: metrics["split_indices"].update(
+                test=[1, 3]
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                models_dir = Path(directory)
+                _, metrics = write_v3_artifacts(models_dir)
+                mutate(metrics)
+                (models_dir / "metrics.json").write_text(
+                    json.dumps(metrics), encoding="utf-8"
+                )
+                loader = Mock(side_effect=AssertionError("runtime must not load"))
+
+                with patch.object(evaluator, "load_dataset", return_value=frame):
+                    with self.assertRaisesRegex(ValueError, "agree|mismatch|match"):
+                        evaluator.evaluate_model(
+                            "fixture.csv",
+                            models_dir=models_dir,
+                            runtime_loader=loader,
+                        )
+
+                loader.assert_not_called()
+
+    def test_runtime_predictions_must_be_exactly_one_dimensional(self):
+        frame = pd.DataFrame(
+            {
+                "price": [100.0, 200.0, 300.0, 400.0],
+                "model": ["A", "B", "C", "D"],
+            }
+        )
+        runtime = Mock()
+        runtime.predict.return_value = np.array([[310.0], [390.0]])
+        loader = Mock(return_value=runtime)
+        with tempfile.TemporaryDirectory() as directory:
+            models_dir = Path(directory)
+            write_v3_artifacts(models_dir)
+            with patch.object(evaluator, "load_dataset", return_value=frame):
+                with self.assertRaisesRegex(ValueError, "one-dimensional|1-D"):
+                    evaluator.evaluate_model(
+                        "fixture.csv",
+                        models_dir=models_dir,
+                        runtime_loader=loader,
+                    )
+
+        loader.assert_called_once_with(models_dir)
 
     def test_v3_manifest_requires_nonempty_recorded_test_indices(self):
         frame = pd.DataFrame({"price": [100.0, 200.0], "model": ["A", "B"]})

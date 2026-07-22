@@ -128,6 +128,39 @@ def load_runtime(models_dir: str | Path):
     return ModelRuntime.from_directory(Path(models_dir))
 
 
+def _validate_v3_artifact_agreement(
+    manifest: Mapping[str, Any],
+    metrics_artifact: Mapping[str, Any],
+) -> None:
+    if not (_is_v3(manifest) or _is_v3(metrics_artifact)):
+        return
+    for field in ("artifact_version", "model_version", "model_type"):
+        manifest_value = manifest.get(field)
+        metrics_value = metrics_artifact.get(field)
+        if (
+            not isinstance(manifest_value, str)
+            or not manifest_value
+            or manifest_value != metrics_value
+        ):
+            raise ValueError(
+                f"v3 model_manifest.json and metrics.json must agree on {field}"
+            )
+    if not _is_v3(manifest) or not _is_v3(metrics_artifact):
+        raise ValueError(
+            "v3 model_manifest.json and metrics.json artifact versions must match"
+        )
+    manifest_split = manifest.get("split_indices")
+    metrics_split = metrics_artifact.get("split_indices")
+    if (
+        not isinstance(manifest_split, Mapping)
+        or not isinstance(metrics_split, Mapping)
+        or dict(manifest_split) != dict(metrics_split)
+    ):
+        raise ValueError(
+            "v3 model_manifest.json and metrics.json split_indices must agree"
+        )
+
+
 def _predict(runtime: Any, evaluation_frame) -> np.ndarray:
     feature_frame = evaluation_frame.drop(columns=["price"])
     if hasattr(runtime, "predict"):
@@ -139,7 +172,9 @@ def _predict(runtime: Any, evaluation_frame) -> np.ndarray:
         ]
     else:
         raise TypeError("ModelRuntime must expose predict(frame) or predict_one(record)")
-    values = np.asarray(predictions, dtype=float).reshape(-1)
+    values = np.asarray(predictions, dtype=float)
+    if values.ndim != 1:
+        raise ValueError("runtime predictions must be exactly one-dimensional")
     if len(values) != len(evaluation_frame):
         raise ValueError("runtime prediction count does not match recorded test count")
     return values
@@ -156,6 +191,7 @@ def evaluate_model(
     root = Path(models_dir) if models_dir is not None else settings.models_dir
     manifest = load_model_manifest(root)
     metrics_artifact = load_metrics_artifact(root)
+    _validate_v3_artifact_agreement(manifest, metrics_artifact)
     evaluation_frame = select_test_frame(frame, manifest)
     baseline = baseline_for_test(frame, manifest, metrics_artifact)
 
@@ -164,7 +200,7 @@ def evaluate_model(
     predictions = _predict(runtime, evaluation_frame)
     actual = evaluation_frame["price"].astype(float).to_numpy()
     metrics = calculate_metrics(actual, predictions, baseline)
-    return {
+    result = {
         "evaluation_scope": "recorded_test" if _is_v3(manifest) else (
             "recorded_test" if _recorded_test_indices(frame, manifest) else "full_dataset"
         ),
@@ -177,6 +213,8 @@ def evaluate_model(
         "count": int(len(actual)),
         "metrics": metrics,
     }
+    result.update(metrics)
+    return result
 
 
 def main() -> None:

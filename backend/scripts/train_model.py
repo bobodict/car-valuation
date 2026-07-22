@@ -6,6 +6,7 @@ import math
 import shutil
 import uuid
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from numbers import Integral, Real
@@ -17,6 +18,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
+from sklearn.utils.validation import check_is_fitted
 
 from services.dataset_contract import load_dataset
 from services.feature_engineering import (
@@ -63,6 +65,11 @@ REQUIRED_REPORTS = (
 )
 LEGACY_CATEGORY_FIELDS = ("vehicle_type", "accident_history")
 DEFAULT_RARE_MODEL_FAMILY_THRESHOLD = 5
+MODEL_OWNERSHIP_SENTINEL = ".model-publication-owner.json"
+_MODEL_OWNER = "car-valuation-model-publication"
+_MODEL_SENTINEL_VERSION = 1
+RUN_STATUS_FILENAME = "run_status.json"
+FAILURE_RECORD_FILENAME = "failure.json"
 
 
 @dataclass
@@ -150,6 +157,58 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"artifact must contain a JSON object: {path}")
     return value
+
+
+def _write_run_status(
+    experiment_dir: Path,
+    run_id: str,
+    started_at: str,
+    stage: str,
+    status: str,
+    **details: Any,
+) -> Path:
+    return _write_json(
+        experiment_dir / RUN_STATUS_FILENAME,
+        {
+            "artifact_version": ARTIFACT_VERSION,
+            "run_id": run_id,
+            "status": status,
+            "stage": stage,
+            "started_at": started_at,
+            "updated_at": _utc_now().isoformat(),
+            **details,
+        },
+    )
+
+
+def _record_run_failure(
+    experiment_dir: Path,
+    run_id: str,
+    started_at: str,
+    stage: str,
+    exc: BaseException,
+) -> Path:
+    timestamp = _utc_now().isoformat()
+    failure = _write_json(
+        experiment_dir / FAILURE_RECORD_FILENAME,
+        {
+            "artifact_version": ARTIFACT_VERSION,
+            "run_id": run_id,
+            "stage": stage,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "timestamp": timestamp,
+        },
+    )
+    _write_run_status(
+        experiment_dir,
+        run_id,
+        started_at,
+        stage,
+        "failed",
+        failure_record=FAILURE_RECORD_FILENAME,
+    )
+    return failure
 
 
 def assess_quality_gate(
@@ -502,6 +561,15 @@ def refit_winner(
     collection_year = _validate_collection_year(collection_year)
     if development_frame.empty:
         raise ValueError("development_frame must not be empty")
+    index_values = development_frame.index.tolist()
+    if any(
+        isinstance(value, bool) or not isinstance(value, Integral)
+        for value in index_values
+    ):
+        raise TypeError("development_frame index must contain integer row IDs")
+    normalized_index = [int(value) for value in index_values]
+    if len(normalized_index) != len(set(normalized_index)):
+        raise ValueError("development_frame index must contain unique row IDs")
     config = _winner_config(winner)
     adapter_factory = adapter_factory or _create_adapter
     adapter = adapter_factory(config, seed)
@@ -580,22 +648,14 @@ def _single_or_multi_metrics(
     baseline = np.full(len(actual), development_mean, dtype=float)
     if len(actual) >= 2:
         return calculate_metrics(actual, predicted, baseline)
-
-    error = predicted - actual
-    relative_error = np.abs(error) / np.maximum(np.abs(actual), 1e-8)
-    log_error = np.log1p(np.maximum(predicted, 0.0)) - np.log1p(actual)
-    return {
-        "mse": float(np.mean(error**2)),
-        "rmse": float(np.sqrt(np.mean(error**2))),
-        "mae": float(np.mean(np.abs(error))),
-        "r2": None,
-        "acc_10": float(np.mean(relative_error <= 0.10)),
-        "acc_20": float(np.mean(relative_error <= 0.20)),
-        "median_ape": float(np.median(relative_error)),
-        "rmsle": float(np.sqrt(np.mean(log_error**2))),
-        "baseline_rmse": float(np.sqrt(np.mean((actual - baseline) ** 2))),
-        "baseline_r2": None,
-    }
+    duplicated = calculate_metrics(
+        np.repeat(actual, 2),
+        np.repeat(predicted, 2),
+        np.repeat(baseline, 2),
+    )
+    duplicated["r2"] = None
+    duplicated["baseline_r2"] = None
+    return duplicated
 
 
 def _group_report(
@@ -658,25 +718,37 @@ def build_error_analysis(
     if not math.isfinite(float(development_mean)):
         raise ValueError("development_mean must be finite")
 
-    quartile_count = min(4, len(actual))
-    if quartile_count:
-        quartile_ids = pd.qcut(
-            pd.Series(actual).rank(method="first"),
-            q=quartile_count,
-            labels=False,
-        ).to_numpy(dtype=int)
-    else:
-        quartile_ids = np.asarray([], dtype=int)
-    quartile_groups = [
-        _group_report(
+    development_prices = development_frame[TARGET_COL].astype(float).to_numpy()
+    if (
+        len(development_prices) == 0
+        or not np.all(np.isfinite(development_prices))
+        or np.any(development_prices < 0)
+    ):
+        raise ValueError("development prices must be nonempty, finite, and nonnegative")
+    boundaries = np.quantile(
+        development_prices,
+        [0.25, 0.5, 0.75],
+        method="linear",
+    ).astype(float)
+    quartile_ids = np.searchsorted(boundaries, actual, side="left")
+    quartile_groups = []
+    for quartile in range(4):
+        group = _group_report(
             f"Q{quartile + 1}",
             quartile_ids == quartile,
             actual,
             predicted,
             development_mean,
         )
-        for quartile in range(quartile_count)
-    ]
+        group["definition_range_inr"] = {
+            "lower_exclusive": (
+                None if quartile == 0 else float(boundaries[quartile - 1])
+            ),
+            "upper_inclusive": (
+                None if quartile == 3 else float(boundaries[quartile])
+            ),
+        }
+        quartile_groups.append(group)
 
     development_models = _normalized_model_names(development_frame)
     test_models = _normalized_model_names(test_frame)
@@ -705,7 +777,11 @@ def build_error_analysis(
             "value_inr": float(development_mean),
         },
         "price_quartiles": {
-            "definition_source": "recorded_test_actual_price",
+            "definition_source": "development_only",
+            "boundary_source": "development_actual_price",
+            "boundary_method": "linear_quantiles_25_50_75",
+            "development_count": int(len(development_prices)),
+            "boundaries_inr": boundaries.tolist(),
             "currency": "INR",
             "groups": quartile_groups,
         },
@@ -794,13 +870,36 @@ def _validate_declared_artifacts(
     return paths
 
 
+def _prepare_artifact_output_directory(output_dir: Path, run_id: str) -> None:
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True, exist_ok=False)
+        return
+    if not output_dir.is_dir():
+        raise FileExistsError("experiment artifact target already exists and is not a directory")
+    entries = list(output_dir.iterdir())
+    if len(entries) != 1 or entries[0].name != RUN_STATUS_FILENAME:
+        raise FileExistsError(
+            "experiment artifact target must be a newly initialized run directory"
+        )
+    status = _read_json(entries[0])
+    if (
+        status.get("artifact_version") != ARTIFACT_VERSION
+        or status.get("run_id") != run_id
+        or status.get("status") != "running"
+    ):
+        raise FileExistsError(
+            "experiment artifact target does not belong to the active run"
+        )
+
+
 def build_artifacts(
     experiment: Mapping[str, Any],
     output_dir: str | Path,
 ) -> list[Path]:
     """Write the complete, strict-JSON v3 experiment artifact set."""
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=False)
+    run_id = str(experiment["run_id"])
+    _prepare_artifact_output_directory(output_dir, run_id)
     frame = experiment["frame"]
     manifest = _json_value(experiment["split_manifest"])
     seed = int(experiment["seed"])
@@ -827,7 +926,6 @@ def build_artifacts(
     holdout = experiment["holdout"]
     metrics = _json_value(holdout["metrics"])
     gate = _json_value(experiment["gate"])
-    run_id = str(experiment["run_id"])
     model_version = str(experiment.get("model_version", f"v3-{run_id}"))
     created_at = str(experiment["created_at"])
     provenance = _json_value(experiment.get("provenance") or {})
@@ -1062,11 +1160,36 @@ def _load_saved_model_for_smoke(
     if model_type == "catboost":
         model = CatBoostRegressor()
         model.load_model(experiment_dir / artifacts["model"])
+        tree_count = getattr(model, "tree_count_", None)
+        if (
+            isinstance(tree_count, bool)
+            or not isinstance(tree_count, Integral)
+            or int(tree_count) <= 0
+        ):
+            raise ValueError("CatBoost artifact must contain a fitted model with trees")
+        is_fitted = getattr(model, "is_fitted", None)
+        if callable(is_fitted) and not bool(is_fitted()):
+            raise ValueError("CatBoost artifact model is not fitted")
         return model
     if model_type == "extra_trees":
         bundle = joblib.load(experiment_dir / artifacts["bundle"])
         if not isinstance(bundle, dict) or not {"preprocessor", "model"}.issubset(bundle):
             raise ValueError("invalid ExtraTrees artifact bundle")
+        preprocessor = bundle["preprocessor"]
+        model = bundle["model"]
+        if not callable(getattr(preprocessor, "transform", None)) or not callable(
+            getattr(model, "predict", None)
+        ):
+            raise ValueError(
+                "ExtraTrees artifact bundle must contain transform/predict components"
+            )
+        try:
+            check_is_fitted(preprocessor)
+            check_is_fitted(model)
+        except Exception as exc:
+            raise ValueError(
+                "ExtraTrees artifact bundle contains unfitted components"
+            ) from exc
         return bundle
     if model_type == "mlp":
         preprocessor = joblib.load(experiment_dir / artifacts["preprocessor"])
@@ -1075,12 +1198,56 @@ def _load_saved_model_for_smoke(
             map_location="cpu",
             weights_only=True,
         )
+        required_checkpoint = {
+            "input_dim",
+            "hidden_dims",
+            "dropout",
+            "model_state",
+            "target_transform",
+        }
+        if not isinstance(checkpoint, Mapping) or not required_checkpoint.issubset(
+            checkpoint
+        ):
+            raise ValueError("MLP checkpoint is missing required keys")
+        input_dim = checkpoint["input_dim"]
+        hidden_dims = checkpoint["hidden_dims"]
+        dropout = checkpoint["dropout"]
+        if (
+            isinstance(input_dim, bool)
+            or not isinstance(input_dim, Integral)
+            or int(input_dim) <= 0
+            or not isinstance(hidden_dims, (list, tuple))
+            or not hidden_dims
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or int(value) <= 0
+                for value in hidden_dims
+            )
+            or isinstance(dropout, bool)
+            or not isinstance(dropout, Real)
+            or not math.isfinite(float(dropout))
+            or not 0.0 <= float(dropout) < 1.0
+            or not isinstance(checkpoint["model_state"], Mapping)
+            or not checkpoint["model_state"]
+            or checkpoint["target_transform"] != "log1p"
+        ):
+            raise ValueError("MLP checkpoint contains invalid fitted-model metadata")
+        if not callable(getattr(preprocessor, "transform", None)):
+            raise ValueError("MLP preprocessor must support transform")
+        try:
+            check_is_fitted(preprocessor)
+        except Exception as exc:
+            raise ValueError("MLP preprocessor is not fitted") from exc
         model = MLPRegressor(
-            int(checkpoint["input_dim"]),
-            tuple(checkpoint["hidden_dims"]),
-            float(checkpoint["dropout"]),
+            int(input_dim),
+            tuple(int(value) for value in hidden_dims),
+            float(dropout),
         )
-        model.load_state_dict(checkpoint["model_state"])
+        try:
+            model.load_state_dict(checkpoint["model_state"], strict=True)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("MLP checkpoint state is not loadable on CPU") from exc
         model.eval()
         return {"preprocessor": preprocessor, "model": model}
     raise ValueError(f"unsupported model_type in manifest: {model_type}")
@@ -1094,9 +1261,307 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
     if versions != {ARTIFACT_VERSION}:
         raise ValueError("all experiment reports must use artifact_version 3.0.0")
     manifest = payloads["model_manifest.json"]
+    feature_config = payloads["feature_config.json"]
+    metrics = payloads["metrics.json"]
+    leaderboard = payloads["leaderboard.json"]
+    error_analysis = payloads["error_analysis.json"]
+    model_card = payloads["model_card.json"]
+
+    required_fields = {
+        "model_manifest.json": {
+            "model_contract_version",
+            "feature_version",
+            "model_version",
+            "model_type",
+            "winner",
+            "model_artifacts",
+            "model_artifact_metadata",
+            "report_artifacts",
+            "refit_strategy",
+            "split_manifest",
+            "split_indices",
+            "provenance",
+            "units",
+            "counts",
+        },
+        "feature_config.json": {
+            "feature_version",
+            "model_version",
+            "target_col",
+            "feature_cols",
+            "target_transform",
+            "category_options",
+            "currency",
+            "price_unit",
+            "mileage_unit",
+        },
+        "metrics.json": {
+            "model_version",
+            "model_type",
+            "winner",
+            "evaluation_scope",
+            "test_metrics",
+            "development_mean_baseline",
+            "baseline_evidence",
+            "quality_gate",
+            "warnings",
+            "thresholds",
+            "split_manifest",
+            "split_indices",
+        },
+        "leaderboard.json": {
+            "model_version",
+            "selection_scope",
+            "selection_method",
+            "winner",
+            "winner_model_type",
+            "candidate_count",
+            "candidates",
+            "outer_test_metrics_in_candidates",
+        },
+        "error_analysis.json": {
+            "model_version",
+            "evaluation_scope",
+            "development_mean_baseline",
+            "baseline_evidence",
+            "price_quartiles",
+            "model_family_frequency",
+            "full_model_seen_status",
+        },
+        "model_card.json": {
+            "model_contract_version",
+            "feature_version",
+            "model_version",
+            "model_type",
+            "winner",
+            "data_source",
+            "currency",
+            "price_unit",
+            "mileage_unit",
+            "sample_count",
+            "split",
+            "thresholds",
+            "quality_gate",
+            "warnings",
+            "test_metrics",
+            "counts",
+            "refit_strategy",
+            "development_mean_baseline",
+            "cv_selection",
+            "independent_holdout",
+            "error_analysis",
+            "category_options",
+            "limitations",
+        },
+    }
+    for report_name, fields in required_fields.items():
+        missing = fields.difference(payloads[report_name])
+        if missing:
+            raise ValueError(
+                f"{report_name} is missing required fields: {sorted(missing)}"
+            )
+
+    model_versions = {
+        payload.get("model_version") for payload in payloads.values()
+    }
+    if len(model_versions) != 1 or not next(iter(model_versions)):
+        raise ValueError("all experiment reports must agree on model_version")
+    if {
+        manifest["feature_version"],
+        feature_config["feature_version"],
+        model_card["feature_version"],
+    } != {FEATURE_VERSION}:
+        raise ValueError("experiment reports must agree on feature_version")
+    if {
+        manifest["model_contract_version"],
+        model_card["model_contract_version"],
+    } != {MODEL_CONTRACT_VERSION}:
+        raise ValueError("experiment reports must agree on model contract version")
+
+    model_type = manifest["model_type"]
+    if model_type not in {"catboost", "extra_trees", "mlp"} or {
+        metrics["model_type"],
+        leaderboard["winner_model_type"],
+        model_card["model_type"],
+    } != {model_type}:
+        raise ValueError("experiment reports must agree on model_type")
+
+    split_manifest = manifest["split_manifest"]
+    split_indices = manifest["split_indices"]
+    if not isinstance(split_manifest, Mapping) or not isinstance(
+        split_indices, Mapping
+    ):
+        raise TypeError("model split manifest and indices must be objects")
+    if metrics["split_manifest"] != split_manifest or metrics["split_indices"] != split_indices:
+        raise ValueError("model_manifest.json and metrics.json split records must agree")
+    for field in ("development", "test", "folds"):
+        if split_indices.get(field) != split_manifest.get(field):
+            raise ValueError(f"split_indices.{field} must agree with split_manifest")
+    refit = manifest["refit_strategy"]
+    if not isinstance(refit, Mapping) or model_card["refit_strategy"] != refit:
+        raise ValueError("experiment reports must agree on refit strategy")
+    if split_indices.get("train") != refit.get("train_indices") or split_indices.get(
+        "validation"
+    ) != refit.get("validation_indices"):
+        raise ValueError("refit strategy indices must agree with split_indices")
+
+    development_ids = {
+        int(value) for value in split_indices.get("development", [])
+    }
+    winner = _validated_candidate_result(
+        manifest["winner"],
+        _winner_config(manifest["winner"]),
+        int(manifest["collection_year"]),
+        development_ids,
+    )
+    if model_card["winner"] != winner:
+        raise ValueError("model manifest and model card winner records must agree")
+    winner_name = winner["name"]
+    if metrics["winner"] != winner_name or leaderboard["winner"] != winner_name:
+        raise ValueError("experiment reports must agree on winner")
+    if winner["model_type"] != model_type:
+        raise ValueError("winner model_type must agree with model manifest")
+
+    candidates = leaderboard["candidates"]
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("leaderboard candidates must be a nonempty list")
+    validated_candidates = [
+        _validated_candidate_result(
+            candidate,
+            _winner_config(candidate),
+            int(manifest["collection_year"]),
+            development_ids,
+        )
+        for candidate in candidates
+    ]
+    ranked_winner = select_winner(validated_candidates)
+    matching_winners = [
+        candidate for candidate in validated_candidates
+        if candidate["name"] == winner_name
+    ]
+    if (
+        leaderboard["selection_scope"] != "development_cv_only"
+        or leaderboard["selection_method"] != "rank_candidates"
+        or leaderboard["outer_test_metrics_in_candidates"] is not False
+        or leaderboard["candidate_count"] != len(validated_candidates)
+        or ranked_winner["name"] != winner_name
+        or len(matching_winners) != 1
+        or matching_winners[0] != winner
+    ):
+        raise ValueError("leaderboard must describe CV-only winner selection")
+
+    test_metrics = _validated_candidate_metrics(
+        metrics["test_metrics"], "test_metrics"
+    )
+    if set(test_metrics) != _CANDIDATE_METRICS:
+        raise ValueError("test_metrics must contain the complete shared metric fields")
+    independent_holdout = model_card["independent_holdout"]
+    if not isinstance(independent_holdout, Mapping):
+        raise TypeError("model card independent_holdout must be an object")
+    if (
+        model_card["test_metrics"] != test_metrics
+        or independent_holdout.get("metrics") != test_metrics
+        or metrics["evaluation_scope"] != "recorded_test"
+        or independent_holdout.get("scope") != "recorded_test"
+    ):
+        raise ValueError("experiment reports must agree on holdout metrics and scope")
+
+    recorded_gate = {
+        "quality_gate": metrics["quality_gate"],
+        "warnings": metrics["warnings"],
+        "thresholds": metrics["thresholds"],
+    }
+    recalculated_gate = assess_quality_gate(test_metrics, metrics["thresholds"])
+    if recorded_gate != recalculated_gate:
+        raise ValueError("recorded quality gate does not agree with recalculated gate")
+    if (
+        model_card["quality_gate"] != recorded_gate["quality_gate"]
+        or model_card["warnings"] != recorded_gate["warnings"]
+        or model_card["thresholds"] != recorded_gate["thresholds"]
+        or independent_holdout.get("quality_gate") != recorded_gate
+    ):
+        raise ValueError("model card quality gate fields must agree with metrics.json")
+
+    development_mean = metrics["development_mean_baseline"]
+    metrics_baseline_evidence = metrics["baseline_evidence"]
+    error_baseline_evidence = error_analysis["baseline_evidence"]
+    nested_error_analysis = {
+        key: value
+        for key, value in error_analysis.items()
+        if key not in {
+            "artifact_version",
+            "model_version",
+            "evaluation_scope",
+            "price_unit",
+        }
+    }
+    if (
+        isinstance(development_mean, bool)
+        or not isinstance(development_mean, Real)
+        or not math.isfinite(float(development_mean))
+        or model_card["development_mean_baseline"] != development_mean
+        or error_analysis["development_mean_baseline"] != development_mean
+        or not isinstance(metrics_baseline_evidence, Mapping)
+        or metrics_baseline_evidence.get("source") != "development_only"
+        or metrics_baseline_evidence.get("value_inr") != development_mean
+        or not isinstance(error_baseline_evidence, Mapping)
+        or error_baseline_evidence.get("source") != "development_only"
+        or error_baseline_evidence.get("value_inr") != development_mean
+        or model_card["error_analysis"] != nested_error_analysis
+    ):
+        raise ValueError("experiment reports must agree on development baseline")
+
+    counts = manifest["counts"]
+    if not isinstance(counts, Mapping) or model_card["counts"] != counts:
+        raise ValueError("model manifest and model card counts must agree")
+    expected_split_counts = {
+        "train": len(split_indices.get("train", [])),
+        "validation": len(split_indices.get("validation", [])),
+        "development": len(split_indices.get("development", [])),
+        "test": len(split_indices.get("test", [])),
+    }
+    if (
+        model_card["split"] != expected_split_counts
+        or model_card["sample_count"] != counts.get("total")
+        or independent_holdout.get("count") != expected_split_counts["test"]
+    ):
+        raise ValueError("model card compatibility counts must agree with split records")
+    if (
+        model_card["data_source"] != manifest["provenance"]
+        or feature_config["category_options"] != model_card["category_options"]
+        or any(
+            payload.get(field) != expected
+            for payload in (feature_config, model_card)
+            for field, expected in (
+                ("currency", "INR"),
+                ("price_unit", "INR"),
+                ("mileage_unit", "km"),
+            )
+        )
+    ):
+        raise ValueError("model card compatibility fields must agree with v3 reports")
+
+    expected_roles = {
+        "catboost": {"model"},
+        "extra_trees": {"bundle"},
+        "mlp": {"preprocessor", "model"},
+    }[model_type]
+    model_artifacts = manifest["model_artifacts"]
+    model_metadata = manifest["model_artifact_metadata"]
+    if (
+        not isinstance(model_artifacts, Mapping)
+        or set(model_artifacts) != expected_roles
+        or not isinstance(model_metadata, Mapping)
+        or model_metadata.get("artifacts") != model_artifacts
+        or model_metadata.get("model_type") != model_type
+        or manifest["target_transform"] != feature_config["target_transform"]
+        or manifest["target_transform"] != model_metadata.get("target_transform")
+        or set(manifest["report_artifacts"]) != set(REQUIRED_REPORTS)
+    ):
+        raise ValueError("model artifact metadata and declared artifact roles must agree")
     _validate_declared_artifacts(
         experiment_dir,
-        manifest.get("model_artifacts"),
+        model_artifacts,
     )
     return payloads
 
@@ -1117,13 +1582,143 @@ def _rename_directory(source: str | Path, target: str | Path) -> Path:
     return Path(source).rename(target)
 
 
+def _protected_publication_paths() -> set[Path]:
+    backend_root = DEFAULT_MODELS_DIR.resolve().parent
+    project_root = backend_root.parent
+    protected = {
+        Path.home().resolve(),
+        backend_root,
+        project_root,
+        Path.cwd().resolve(),
+    }
+    protected.update(project_root.parents)
+    protected.update(Path.cwd().resolve().parents)
+    return protected
+
+
+def _has_ownership_sentinel(formal_dir: Path) -> bool:
+    sentinel = formal_dir / MODEL_OWNERSHIP_SENTINEL
+    if not sentinel.is_file():
+        return False
+    try:
+        payload = _read_json(sentinel)
+    except (OSError, TypeError, ValueError):
+        return False
+    return payload == {
+        "owner": _MODEL_OWNER,
+        "sentinel_version": _MODEL_SENTINEL_VERSION,
+    }
+
+
+def _has_legacy_model_signature(formal_dir: Path) -> bool:
+    required = ("feature_config.json", "metrics.json", "model_card.json")
+    try:
+        payloads = [_read_json(formal_dir / name) for name in required]
+    except (OSError, TypeError, ValueError):
+        return False
+    if {payload.get("artifact_version") for payload in payloads} != {"2.0.0"}:
+        return False
+    versions = {payload.get("model_version") for payload in payloads}
+    if len(versions) != 1 or not next(iter(versions)):
+        return False
+    return (
+        (formal_dir / "preprocess.joblib").is_file()
+        and (formal_dir / "price_mlp.pt").is_file()
+    )
+
+
+def _has_v3_model_signature(formal_dir: Path) -> bool:
+    try:
+        _validate_experiment_directory(formal_dir)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _validate_publication_target(
+    requested_formal_dir: str | Path,
+    formal_dir: Path,
+) -> None:
+    requested = Path(requested_formal_dir)
+    lexical = requested.absolute()
+    if requested.exists() and lexical != formal_dir:
+        raise ValueError("formal model directory must not be a symlink or junction")
+    if formal_dir in _protected_publication_paths():
+        raise ValueError("formal model directory resolves to a protected broad path")
+    if formal_dir.exists() and not formal_dir.is_dir():
+        raise ValueError("formal model target exists as a file, not a directory")
+
+
+def _validate_formal_ownership(formal_dir: Path) -> None:
+    if not formal_dir.exists() or not any(formal_dir.iterdir()):
+        return
+    if formal_dir == DEFAULT_MODELS_DIR.resolve():
+        if _has_legacy_model_signature(formal_dir) or _has_v3_model_signature(
+            formal_dir
+        ) or _has_ownership_sentinel(formal_dir):
+            return
+    elif _has_ownership_sentinel(formal_dir) or _has_legacy_model_signature(
+        formal_dir
+    ) or _has_v3_model_signature(formal_dir):
+        return
+    raise ValueError(
+        "existing nonempty formal target is not an owned model directory"
+    )
+
+
+def _write_ownership_sentinel(directory: Path) -> Path:
+    return _write_json(
+        directory / MODEL_OWNERSHIP_SENTINEL,
+        {
+            "owner": _MODEL_OWNER,
+            "sentinel_version": _MODEL_SENTINEL_VERSION,
+        },
+    )
+
+
+@contextmanager
+def _publication_lock(formal_dir: Path):
+    lock_dir = formal_dir.with_name(f".{formal_dir.name}.publish.lock")
+    try:
+        lock_dir.mkdir()
+    except FileExistsError:
+        raise FileExistsError(
+            f"another publication owns the model directory lock: {lock_dir}"
+        ) from None
+    try:
+        yield
+    finally:
+        try:
+            lock_dir.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def _remove_generated_publication_tree(
+    path: Path,
+    formal_dir: Path,
+    kind: str,
+) -> None:
+    expected_prefix = f".{formal_dir.name}.{kind}-"
+    if (
+        kind not in {"staging", "backup"}
+        or path.parent != formal_dir.parent
+        or not path.name.startswith(expected_prefix)
+        or len(path.name) <= len(expected_prefix)
+    ):
+        raise ValueError("refusing cleanup outside generated publication paths")
+    shutil.rmtree(path)
+
+
 def publish_experiment(
     experiment_dir: str | Path,
     formal_dir: str | Path,
 ) -> bool:
     """Publish a passing experiment copy with backup and rollback."""
+    requested_formal_dir = formal_dir
     experiment_dir = Path(experiment_dir).resolve(strict=True)
     formal_dir = Path(formal_dir).resolve(strict=False)
+    _validate_publication_target(requested_formal_dir, formal_dir)
     if (
         experiment_dir == formal_dir
         or experiment_dir.is_relative_to(formal_dir)
@@ -1146,31 +1741,48 @@ def publish_experiment(
         return False
 
     _validate_experiment_directory(experiment_dir)
+    _validate_formal_ownership(formal_dir)
     formal_dir.parent.mkdir(parents=True, exist_ok=True)
-    token = uuid.uuid4().hex
-    staging_dir = formal_dir.with_name(f".{formal_dir.name}.staging-{token}")
-    backup_dir = formal_dir.with_name(f".{formal_dir.name}.backup-{token}")
-    if staging_dir.exists() or backup_dir.exists():
-        raise FileExistsError("publication staging or backup path already exists")
+    with _publication_lock(formal_dir):
+        _validate_formal_ownership(formal_dir)
+        token = uuid.uuid4().hex
+        staging_dir = formal_dir.with_name(f".{formal_dir.name}.staging-{token}")
+        backup_dir = formal_dir.with_name(f".{formal_dir.name}.backup-{token}")
+        if staging_dir.exists() or backup_dir.exists():
+            raise FileExistsError("publication staging or backup path already exists")
 
-    backup_created = False
-    try:
-        shutil.copytree(experiment_dir, staging_dir)
-        _validate_experiment_directory(staging_dir)
-        if formal_dir.exists():
-            _rename_directory(formal_dir, backup_dir)
-            backup_created = True
-        _rename_directory(staging_dir, formal_dir)
-    except Exception:
-        if backup_created and backup_dir.exists() and not formal_dir.exists():
-            _rename_directory(backup_dir, formal_dir)
-        raise
-    finally:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
+        backup_created = False
+        try:
+            shutil.copytree(experiment_dir, staging_dir)
+            _write_ownership_sentinel(staging_dir)
+            _validate_experiment_directory(staging_dir)
+            if formal_dir.exists():
+                _rename_directory(formal_dir, backup_dir)
+                backup_created = True
+            _rename_directory(staging_dir, formal_dir)
+        except Exception:
+            if backup_created and backup_dir.exists() and not formal_dir.exists():
+                _rename_directory(backup_dir, formal_dir)
+            raise
+        finally:
+            if staging_dir.exists():
+                _remove_generated_publication_tree(
+                    staging_dir,
+                    formal_dir,
+                    "staging",
+                )
 
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir)
+        if backup_dir.exists():
+            try:
+                _remove_generated_publication_tree(
+                    backup_dir,
+                    formal_dir,
+                    "backup",
+                )
+            except OSError:
+                # The formal swap is complete. Keep the backup recoverable rather
+                # than report a false publication failure.
+                pass
     return True
 
 
@@ -1189,77 +1801,213 @@ def train_and_publish(
     rare_threshold: int = DEFAULT_RARE_MODEL_FAMILY_THRESHOLD,
 ) -> dict[str, Any]:
     """Run the fixed v3 train/evaluate/audit/publish orchestration."""
-    collection_year = _validate_collection_year(collection_year)
-    frame = load_dataset(dataset_path).drop_duplicates().reset_index(drop=True)
-    manifest = build_split_manifest(frame, seed)
-    competition_candidates = default_candidates() if candidates is None else candidates
-    leaderboard = run_competition(
-        frame,
-        manifest,
-        competition_candidates,
-        seed,
-        collection_year,
-        evaluator=candidate_evaluator,
-    )
-    winner = select_winner(leaderboard)
-    fitted = refit_winner(
-        frame.loc[manifest["development"]],
-        winner,
-        seed,
-        collection_year,
-        adapter_factory=adapter_factory,
-    )
-    holdout = evaluate_holdout(fitted, frame.loc[manifest["test"]])
-    gate = assess_quality_gate(holdout["metrics"])
-
     run_id = _new_run_id()
     created_at = _utc_now().isoformat()
     experiment_dir = Path(experiments_dir) / run_id
-    source = {
-        "source_id": "normalized-training-csv",
-        "source_url": SOURCE_URL,
-        "raw_path": str(Path(dataset_path)),
-    }
-    if provenance:
-        source.update(provenance)
-    experiment = {
-        "run_id": run_id,
-        "created_at": created_at,
-        "frame": frame,
-        "split_manifest": manifest,
-        "leaderboard": leaderboard,
-        "winner": winner,
-        "fitted_model": fitted,
-        "refit": _refit_metadata(fitted),
-        "holdout": holdout,
-        "gate": gate,
-        "seed": seed,
-        "collection_year": collection_year,
-        "provenance": source,
-        "rare_threshold": rare_threshold,
-    }
-    write_experiment_artifacts(experiment, experiment_dir)
+    experiment_dir.mkdir(parents=True, exist_ok=False)
+    stage = "initialize"
+    _write_run_status(
+        experiment_dir,
+        run_id,
+        created_at,
+        stage,
+        "running",
+    )
 
-    smoke_status = "pass"
-    smoke_error = None
     try:
-        smoke_load_experiment(experiment_dir, loader=smoke_loader)
-    except Exception as exc:
-        smoke_status = "fail"
-        smoke_error = f"{type(exc).__name__}: {exc}"
-        _write_json(
-            experiment_dir / "smoke_failure.json",
-            {
-                "artifact_version": ARTIFACT_VERSION,
-                "stage": "smoke_load_experiment",
-                "error": smoke_error,
-                "created_at": _utc_now().isoformat(),
-            },
+        stage = "validate_collection_year"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        collection_year = _validate_collection_year(collection_year)
+
+        stage = "load_dataset"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        frame = load_dataset(dataset_path).drop_duplicates().reset_index(drop=True)
+
+        stage = "build_split_manifest"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        manifest = build_split_manifest(frame, seed)
+
+        stage = "run_competition"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        competition_candidates = (
+            default_candidates() if candidates is None else candidates
+        )
+        leaderboard = run_competition(
+            frame,
+            manifest,
+            competition_candidates,
+            seed,
+            collection_year,
+            evaluator=candidate_evaluator,
         )
 
-    published = False
-    if gate["quality_gate"] == "pass" and smoke_status == "pass":
-        published = publish_experiment(experiment_dir, models_dir)
+        stage = "select_winner"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        winner = select_winner(leaderboard)
+
+        stage = "refit_winner"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        fitted = refit_winner(
+            frame.loc[manifest["development"]],
+            winner,
+            seed,
+            collection_year,
+            adapter_factory=adapter_factory,
+        )
+
+        stage = "evaluate_holdout"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        holdout = evaluate_holdout(fitted, frame.loc[manifest["test"]])
+
+        stage = "assess_quality_gate"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        gate = assess_quality_gate(holdout["metrics"])
+
+        source = {
+            "source_id": "normalized-training-csv",
+            "source_url": SOURCE_URL,
+            "raw_path": str(Path(dataset_path)),
+        }
+        if provenance:
+            source.update(provenance)
+        experiment = {
+            "run_id": run_id,
+            "created_at": created_at,
+            "frame": frame,
+            "split_manifest": manifest,
+            "leaderboard": leaderboard,
+            "winner": winner,
+            "fitted_model": fitted,
+            "refit": _refit_metadata(fitted),
+            "holdout": holdout,
+            "gate": gate,
+            "seed": seed,
+            "collection_year": collection_year,
+            "provenance": source,
+            "rare_threshold": rare_threshold,
+        }
+
+        stage = "write_experiment_artifacts"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        write_experiment_artifacts(experiment, experiment_dir)
+
+        smoke_status = "pass"
+        smoke_error = None
+        stage = "smoke_load_experiment"
+        _write_run_status(
+            experiment_dir, run_id, created_at, stage, "running"
+        )
+        try:
+            smoke_load_experiment(experiment_dir, loader=smoke_loader)
+        except Exception as exc:
+            smoke_status = "fail"
+            smoke_error = f"{type(exc).__name__}: {exc}"
+            _write_json(
+                experiment_dir / "smoke_failure.json",
+                {
+                    "artifact_version": ARTIFACT_VERSION,
+                    "stage": stage,
+                    "error": smoke_error,
+                    "created_at": _utc_now().isoformat(),
+                },
+            )
+            _record_run_failure(
+                experiment_dir,
+                run_id,
+                created_at,
+                stage,
+                exc,
+            )
+            return {
+                "artifact_version": ARTIFACT_VERSION,
+                "model_version": f"v3-{run_id}",
+                "model_type": winner["model_type"],
+                "winner": winner["name"],
+                "collection_year": collection_year,
+                "seed": seed,
+                "quality_gate": gate["quality_gate"],
+                "warnings": gate["warnings"],
+                "thresholds": gate["thresholds"],
+                "test_metrics": holdout["metrics"],
+                "experiment_dir": str(experiment_dir),
+                "smoke_status": smoke_status,
+                "smoke_error": smoke_error,
+                "published": False,
+            }
+
+        published = False
+        if gate["quality_gate"] == "pass":
+            stage = "publish_experiment"
+            _write_run_status(
+                experiment_dir, run_id, created_at, stage, "running"
+            )
+            published = publish_experiment(experiment_dir, models_dir)
+            if not published:
+                rejection = RuntimeError(
+                    "publication rejected a smoke-validated passing experiment"
+                )
+                _record_run_failure(
+                    experiment_dir,
+                    run_id,
+                    created_at,
+                    stage,
+                    rejection,
+                )
+                smoke_error = None
+                return {
+                    "artifact_version": ARTIFACT_VERSION,
+                    "model_version": f"v3-{run_id}",
+                    "model_type": winner["model_type"],
+                    "winner": winner["name"],
+                    "collection_year": collection_year,
+                    "seed": seed,
+                    "quality_gate": gate["quality_gate"],
+                    "warnings": gate["warnings"],
+                    "thresholds": gate["thresholds"],
+                    "test_metrics": holdout["metrics"],
+                    "experiment_dir": str(experiment_dir),
+                    "smoke_status": smoke_status,
+                    "smoke_error": smoke_error,
+                    "published": False,
+                }
+
+        stage = "complete"
+        _write_run_status(
+            experiment_dir,
+            run_id,
+            created_at,
+            stage,
+            "completed",
+            published=published,
+            quality_gate=gate["quality_gate"],
+        )
+    except Exception as exc:
+        _record_run_failure(
+            experiment_dir,
+            run_id,
+            created_at,
+            stage,
+            exc,
+        )
+        raise
 
     return {
         "artifact_version": ARTIFACT_VERSION,
