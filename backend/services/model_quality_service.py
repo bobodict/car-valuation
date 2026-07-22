@@ -44,5 +44,7 @@ def get_model_health() -> dict:
         "mileage_unit": artifact.get("mileage_unit", "km"),
         "data_source": artifact.get("data_source", {}),
         "model_version": artifact.get("model_version", "unknown"),
+        "model_type": artifact.get("model_type", "mlp"),
+        "feature_version": artifact.get("feature_version", "2.0.0"),
         "sample_count": artifact.get("sample_count", 0),
     }

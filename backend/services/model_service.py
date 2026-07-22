@@ -3,6 +3,7 @@ import math
 from predict_service import predict_price_one
 from schemas import PredictRequest
 from services.metrics_service import load_metrics
+from services.model_runtime import ModelRuntimeError
 
 
 class ModelServiceError(RuntimeError):
@@ -43,6 +44,16 @@ def build_model_input(req: PredictRequest) -> dict:
         "seats": req.seats,
         "accident_history": req.accident_history,
         "owner_count": req.owner_count,
+        "seller_type": req.seller_type,
+        "drivetrain": req.drivetrain,
+        "max_power_bhp": req.max_power_bhp,
+        "power_rpm": req.power_rpm,
+        "max_torque_nm": req.max_torque_nm,
+        "torque_rpm": req.torque_rpm,
+        "length_mm": req.length_mm,
+        "width_mm": req.width_mm,
+        "height_mm": req.height_mm,
+        "fuel_tank_liter": req.fuel_tank_liter,
     }
 
 
@@ -51,6 +62,10 @@ def call_model_api(req: PredictRequest) -> dict:
     try:
         raw_price = float(predict_price_one(model_input))
         metrics = load_metrics()
+    except ModelRuntimeError as exc:
+        raise ModelServiceError(
+            "model service is unavailable; check model artifacts and runtime dependencies"
+        ) from exc
     except Exception as exc:
         raise ModelServiceError(
             "model service is unavailable; check model artifacts and runtime dependencies"
@@ -82,6 +97,8 @@ def call_model_api(req: PredictRequest) -> dict:
         "price_unit": metrics.get("price_unit", "INR"),
         "mileage_unit": metrics.get("mileage_unit", "km"),
         "model_version": metrics.get("model_version", "unknown"),
+        "model_type": metrics.get("model_type", "mlp"),
+        "feature_version": metrics.get("feature_version", "2.0.0"),
         "metrics": metrics["test_metrics"],
         "comment": (
             f"Experimental estimate from {source_id}; test R2={r2:.3f}. "
