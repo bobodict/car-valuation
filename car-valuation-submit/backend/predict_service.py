@@ -48,6 +48,8 @@ ckpt = torch.load(MODEL_PATH, map_location=device)
 input_dim = ckpt["input_dim"]
 hidden_dims = ckpt["hidden_dims"]
 dropout = ckpt.get("dropout", 0.0)
+TARGET_MEAN = float(ckpt.get("target_mean", 0.0))
+TARGET_STD = float(ckpt.get("target_std", 1.0))
 
 model = MLPRegressor(input_dim, hidden_dims, dropout).to(device)
 model.load_state_dict(ckpt["model_state"])
@@ -79,9 +81,9 @@ def predict_price_one(car_dict: dict) -> float:
     X_tensor = torch.from_numpy(X_proc.astype("float32")).to(device)
 
     with torch.no_grad():
-        pred = model(X_tensor).cpu().numpy().flatten()[0]
+        scaled_prediction = model(X_tensor).cpu().numpy().flatten()[0]
 
-    return float(pred)
+    return float(scaled_prediction * TARGET_STD + TARGET_MEAN)
 
 if __name__ == "__main__":
     example = {
