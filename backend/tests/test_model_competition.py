@@ -1,10 +1,9 @@
+import json
 import unittest
-import warnings
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 
 import numpy as np
-from sklearn.exceptions import UndefinedMetricWarning
 
 from services import model_competition
 from services.model_competition import (
@@ -57,29 +56,25 @@ class ModelCompetitionTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["rmsle"], expected_rmsle)
 
     def test_acc_10_distinguishes_exact_threshold_from_decimal_outside(self):
-        actual = np.array([100.0])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UndefinedMetricWarning)
-            exact = calculate_metrics(actual, actual * 1.1, actual)
-            outside = calculate_metrics(
-                actual,
-                actual * 1.100000000000001,
-                actual,
-            )
+        actual = np.array([100.0, 200.0])
+        exact = calculate_metrics(actual, actual * 1.1, actual)
+        outside = calculate_metrics(
+            actual,
+            actual * 1.100000000000001,
+            actual,
+        )
 
         self.assertEqual(exact["acc_10"], 1.0)
         self.assertEqual(outside["acc_10"], 0.0)
 
     def test_acc_20_distinguishes_exact_threshold_from_decimal_outside(self):
-        actual = np.array([100.0])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UndefinedMetricWarning)
-            exact = calculate_metrics(actual, actual * 1.2, actual)
-            outside = calculate_metrics(
-                actual,
-                actual * 1.200000000000001,
-                actual,
-            )
+        actual = np.array([100.0, 200.0])
+        exact = calculate_metrics(actual, actual * 1.2, actual)
+        outside = calculate_metrics(
+            actual,
+            actual * 1.200000000000001,
+            actual,
+        )
 
         self.assertEqual(exact["acc_20"], 1.0)
         self.assertEqual(outside["acc_20"], 0.0)
@@ -126,6 +121,124 @@ class ModelCompetitionTests(unittest.TestCase):
 
         self.assertEqual(metrics["acc_10"], 0.5)
         self.assertEqual(metrics["acc_20"], 0.5)
+
+    def test_metrics_reject_negative_price_series(self):
+        valid = np.array([100.0, 200.0])
+
+        for name in ("actual", "predicted", "baseline"):
+            values = {
+                "actual": valid.copy(),
+                "predicted": valid.copy(),
+                "baseline": valid.copy(),
+            }
+            values[name][0] = -1.0
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"{name} must contain only nonnegative prices",
+                ):
+                    calculate_metrics(**values)
+
+    def test_metrics_reject_sklearn_negative_one_rmsle_edge_case(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "actual must contain only nonnegative prices",
+        ):
+            calculate_metrics(
+                actual=np.array([-1.0, 0.0]),
+                predicted=np.array([-1.0, 0.0]),
+                baseline=np.array([0.0, 0.0]),
+            )
+
+    def test_metrics_reject_nonfinite_price_series(self):
+        valid = np.array([100.0, 200.0])
+
+        for name in ("actual", "predicted", "baseline"):
+            for invalid in (np.nan, np.inf, -np.inf):
+                values = {
+                    "actual": valid.copy(),
+                    "predicted": valid.copy(),
+                    "baseline": valid.copy(),
+                }
+                values[name][0] = invalid
+                with self.subTest(name=name, invalid=invalid):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"{name} must contain only finite prices",
+                    ):
+                        calculate_metrics(**values)
+
+    def test_metrics_reject_column_and_multioutput_arrays(self):
+        valid = np.array([100.0, 200.0])
+        invalid_shapes = (
+            np.array([[100.0], [200.0]]),
+            np.array([[100.0, 200.0], [300.0, 400.0]]),
+        )
+
+        for name in ("actual", "predicted", "baseline"):
+            for invalid in invalid_shapes:
+                values = {
+                    "actual": valid,
+                    "predicted": valid,
+                    "baseline": valid,
+                    name: invalid,
+                }
+                with self.subTest(name=name, shape=invalid.shape):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"{name} must be one-dimensional",
+                    ):
+                        calculate_metrics(**values)
+
+    def test_metrics_reject_scalar_and_empty_arrays(self):
+        valid = np.array([100.0, 200.0])
+
+        for name in ("actual", "predicted", "baseline"):
+            for invalid, message in (
+                (100.0, f"{name} must be one-dimensional"),
+                (np.array([]), f"{name} must not be empty"),
+            ):
+                values = {
+                    "actual": valid,
+                    "predicted": valid,
+                    "baseline": valid,
+                    name: invalid,
+                }
+                with self.subTest(name=name, message=message):
+                    with self.assertRaisesRegex(ValueError, message):
+                        calculate_metrics(**values)
+
+    def test_metrics_require_equal_lengths_before_broadcasting(self):
+        cases = (
+            (
+                np.array([100.0, 200.0, 300.0]),
+                np.array([100.0, 200.0]),
+                np.array([100.0, 200.0, 300.0]),
+            ),
+            (
+                np.array([100.0, 200.0]),
+                np.array([100.0]),
+                np.array([100.0, 200.0]),
+            ),
+        )
+
+        for actual, predicted, baseline in cases:
+            lengths = (len(actual), len(predicted), len(baseline))
+            with self.subTest(lengths=lengths):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "actual, predicted, and baseline must have equal lengths",
+                ):
+                    calculate_metrics(actual, predicted, baseline)
+
+    def test_metrics_require_at_least_two_samples(self):
+        values = np.array([100.0])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "metric inputs must contain at least two samples",
+        ):
+            calculate_metrics(values, values, values)
 
     def test_candidate_config_and_search_spaces_are_exact_and_bounded(self):
         config = CandidateConfig(
@@ -333,18 +446,278 @@ class ModelCompetitionTests(unittest.TestCase):
                 complexity=1,
             )
 
+    def test_candidate_config_validates_identity_params_and_complexity(self):
+        valid = {
+            "name": "candidate",
+            "model_type": "mlp",
+            "params": {},
+            "complexity": 1,
+        }
+        cases = (
+            ("name", 1, TypeError, "name must be a nonempty string"),
+            ("name", " ", ValueError, "name must be a nonempty string"),
+            (
+                "model_type",
+                None,
+                TypeError,
+                "model_type must be a nonempty string",
+            ),
+            (
+                "model_type",
+                "",
+                ValueError,
+                "model_type must be a nonempty string",
+            ),
+            ("params", [], TypeError, "params must be a mapping"),
+            (
+                "complexity",
+                True,
+                TypeError,
+                "complexity must be a nonnegative integer",
+            ),
+            (
+                "complexity",
+                1.5,
+                TypeError,
+                "complexity must be a nonnegative integer",
+            ),
+            (
+                "complexity",
+                -1,
+                ValueError,
+                "complexity must be nonnegative",
+            ),
+        )
+
+        for field, invalid, exception, message in cases:
+            values = {**valid, field: invalid}
+            with self.subTest(field=field, invalid=invalid):
+                with self.assertRaisesRegex(exception, message):
+                    CandidateConfig(**values)
+
+    def test_candidate_config_requires_recursive_nonempty_string_keys(self):
+        cases = (
+            ({1: "value"}, TypeError),
+            ({"": "value"}, ValueError),
+            ({"nested": {" ": "value"}}, ValueError),
+        )
+
+        for params, exception in cases:
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(
+                    exception,
+                    "config keys must be nonempty strings",
+                ):
+                    CandidateConfig("candidate", "mlp", params, 1)
+
+    def test_candidate_config_rejects_nonfinite_params(self):
+        for invalid in (np.nan, np.inf, -np.inf):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "config float values must be finite",
+                ):
+                    CandidateConfig(
+                        "candidate",
+                        "mlp",
+                        {"learning_rate": invalid},
+                        1,
+                    )
+
+    def test_candidate_config_to_dict_is_detached_and_json_safe(self):
+        config = CandidateConfig(
+            name="mlp-canonical",
+            model_type="mlp",
+            params={
+                "hidden_dims": np.array([128, 64]),
+                "nested": {
+                    "labels": {"stable", "cpu"},
+                    "pairs": {(2, 1), (1, 2)},
+                },
+                "signature": bytearray(b"v1"),
+            },
+            complexity=np.int64(2),
+        )
+
+        serialized = config.to_dict()
+
+        self.assertEqual(
+            serialized,
+            {
+                "name": "mlp-canonical",
+                "model_type": "mlp",
+                "params": {
+                    "hidden_dims": [128, 64],
+                    "nested": {
+                        "labels": ["cpu", "stable"],
+                        "pairs": [[1, 2], [2, 1]],
+                    },
+                    "signature": {"__bytes_hex__": "7631"},
+                },
+                "complexity": 2,
+            },
+        )
+        self.assertEqual(
+            json.loads(json.dumps(serialized, allow_nan=False)),
+            serialized,
+        )
+        serialized["params"]["hidden_dims"].append(32)
+        serialized["params"]["nested"]["labels"].append("changed")
+        self.assertEqual(config.params["hidden_dims"], (128, 64))
+        self.assertEqual(
+            config.params["nested"]["labels"],
+            frozenset({"stable", "cpu"}),
+        )
+
+    def test_metadata_sort_key_reuses_canonical_config_serialization(self):
+        config = CandidateConfig(
+            "canonical",
+            "extra_trees",
+            {"labels": {"zeta", "alpha"}},
+            1,
+        )
+        result = candidate("same", 0.5, 0.1, 0.8, 1, config=config.params)
+
+        self.assertEqual(
+            model_competition._metadata_sort_key(result)[1],
+            '{"labels":["alpha","zeta"]}',
+        )
+
     def test_candidate_sort_key_uses_cv_metrics_then_complexity(self):
         result = candidate("cat", 0.55, 0.12, 0.8, 2)
 
         self.assertEqual(candidate_sort_key(result), (-0.55, 0.12, -0.8, 2))
 
-    def test_rank_candidates_ignores_test_metrics(self):
-        winner = rank_candidates(
-            [
-                candidate("cat", 0.55, 0.12, 0.8, 2, test_acc_10=0.0),
-                candidate("tree", 0.40, 0.10, 0.9, 1, test_acc_10=1.0),
-            ]
+    def test_rank_candidates_rejects_empty_results(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "results must contain at least one candidate",
+        ):
+            rank_candidates([])
+
+    def test_rank_candidates_rejects_missing_or_invalid_cv_data(self):
+        valid = candidate("valid", 0.5, 0.1, 0.8, 1)
+        cases = (
+            (
+                {key: value for key, value in valid.items() if key != "cv"},
+                ValueError,
+                "candidate 0 must include cv",
+            ),
+            (
+                {**valid, "cv": []},
+                TypeError,
+                "candidate 0 cv must be a mapping",
+            ),
         )
+
+        for result, exception, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(exception, message):
+                    rank_candidates([result])
+
+        for field in ("acc_10_mean", "median_ape_mean", "r2_mean"):
+            invalid = candidate("invalid", 0.5, 0.1, 0.8, 1)
+            del invalid["cv"][field]
+            with self.subTest(missing=field):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"candidate 0 cv must include {field}",
+                ):
+                    rank_candidates([invalid])
+
+    def test_rank_candidates_rejects_bool_and_nonnumeric_cv_metrics(self):
+        for field in ("acc_10_mean", "median_ape_mean", "r2_mean"):
+            for invalid_value in (True, "0.5"):
+                result = candidate("invalid", 0.5, 0.1, 0.8, 1)
+                result["cv"][field] = invalid_value
+                with self.subTest(field=field, invalid_value=invalid_value):
+                    with self.assertRaisesRegex(
+                        TypeError,
+                        f"candidate 0 cv.{field} must be a real number",
+                    ):
+                        rank_candidates([result])
+
+    def test_rank_candidates_rejects_nonfinite_cv_metrics(self):
+        for field in ("acc_10_mean", "median_ape_mean", "r2_mean"):
+            for invalid_value in (np.nan, np.inf, -np.inf):
+                result = candidate("invalid", 0.5, 0.1, 0.8, 1)
+                result["cv"][field] = invalid_value
+                with self.subTest(field=field, invalid_value=invalid_value):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"candidate 0 cv.{field} must be finite",
+                    ):
+                        rank_candidates([result])
+
+    def test_rank_candidates_rejects_invalid_metric_ranges(self):
+        cases = (
+            ("acc_10_mean", -0.01, "must be between 0 and 1"),
+            ("acc_10_mean", 1.01, "must be between 0 and 1"),
+            ("median_ape_mean", -0.01, "must be nonnegative"),
+        )
+
+        for field, invalid_value, message in cases:
+            result = candidate("invalid", 0.5, 0.1, 0.8, 1)
+            result["cv"][field] = invalid_value
+            with self.subTest(field=field, invalid_value=invalid_value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"candidate 0 cv.{field} {message}",
+                ):
+                    rank_candidates([result])
+
+    def test_rank_candidates_accepts_finite_negative_r2(self):
+        result = candidate("valid", 0.5, 0.1, -2.0, 1)
+
+        self.assertIs(rank_candidates([result]), result)
+
+    def test_rank_candidates_rejects_invalid_complexity(self):
+        cases = (
+            ({}, ValueError, "candidate 0 must include complexity"),
+            (
+                {"complexity": True},
+                TypeError,
+                "candidate 0 complexity must be a nonnegative integer",
+            ),
+            (
+                {"complexity": 1.5},
+                TypeError,
+                "candidate 0 complexity must be a nonnegative integer",
+            ),
+            (
+                {"complexity": -1},
+                ValueError,
+                "candidate 0 complexity must be nonnegative",
+            ),
+        )
+
+        for replacement, exception, message in cases:
+            result = candidate("invalid", 0.5, 0.1, 0.8, 1)
+            result.pop("complexity")
+            result.update(replacement)
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(exception, message):
+                    rank_candidates([result])
+
+    def test_rank_candidates_validates_results_outside_tie_window(self):
+        valid = candidate("valid", 0.9, 0.1, 0.8, 1)
+        invalid = candidate("invalid", 0.1, np.nan, 0.8, 1)
+
+        for results in ([valid, invalid], [invalid, valid]):
+            with self.subTest(order=[result["name"] for result in results]):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "cv.median_ape_mean must be finite",
+                ):
+                    rank_candidates(results)
+
+    def test_rank_candidates_ignores_test_metrics(self):
+        cat = candidate("cat", 0.55, 0.12, 0.8, 2, test_acc_10=0.0)
+        tree = candidate("tree", 0.40, 0.10, 0.9, 1, test_acc_10=1.0)
+        cat["test_metrics"] = object()
+        tree["test_metrics"] = {"acc_10": np.nan, "invalid": True}
+
+        winner = rank_candidates([cat, tree])
 
         self.assertEqual(winner["name"], "cat")
 
