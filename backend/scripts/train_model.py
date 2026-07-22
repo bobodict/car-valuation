@@ -195,19 +195,209 @@ def assess_quality_gate(
     }
 
 
-def _without_post_selection_fields(result: Mapping[str, Any]) -> dict[str, Any]:
-    prohibited = {
-        "error_analysis",
-        "holdout_metrics",
-        "outer_test_metrics",
-        "subgroup_diagnostics",
-        "test_metrics",
+_CANDIDATE_METRICS = frozenset(
+    {
+        "mse",
+        "rmse",
+        "mae",
+        "r2",
+        "acc_10",
+        "acc_20",
+        "median_ape",
+        "rmsle",
+        "baseline_rmse",
+        "baseline_r2",
     }
+)
+_CANDIDATE_CV_FIELDS = frozenset(
+    f"{metric}_{statistic}"
+    for metric in _CANDIDATE_METRICS
+    for statistic in ("mean", "std")
+)
+_CANDIDATE_RESULT_FIELDS = frozenset(
+    {
+        "name",
+        "model_type",
+        "config",
+        "complexity",
+        "collection_year",
+        "candidate",
+        "fold_metrics",
+        "cv",
+        "observed_train_indices",
+        "observed_validation_indices",
+    }
+)
+
+
+class _SealedCompetitionManifest(Mapping[str, Any]):
+    def __init__(self, manifest: Mapping[str, Any]):
+        self._keys = tuple(manifest)
+        required = {"development", "test", "folds"}
+        if not required.issubset(self._keys):
+            raise ValueError("manifest must include development, test, and folds")
+        self._values = {
+            key: _json_value(manifest[key])
+            for key in self._keys
+            if key != "test"
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "test":
+            raise RuntimeError("outer-test manifest value is sealed during competition")
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+
+def _validated_candidate_number(value: Any, path: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"candidate result {path} must be a finite number")
+    return float(value)
+
+
+def _validated_candidate_metrics(
+    value: Any,
+    path: str,
+) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"candidate result {path} must be an object")
+    unexpected = set(value).difference(_CANDIDATE_METRICS)
+    if unexpected:
+        raise ValueError(
+            f"candidate result {path} contains unexpected fields: {sorted(unexpected)}"
+        )
     return {
-        key: _json_value(value)
-        for key, value in result.items()
-        if key not in prohibited
+        key: _validated_candidate_number(value[key], f"{path}.{key}")
+        for key in sorted(value)
     }
+
+
+def _validated_candidate_cv(value: Any) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        raise TypeError("candidate result cv must be an object")
+    unexpected = set(value).difference(_CANDIDATE_CV_FIELDS)
+    if unexpected:
+        raise ValueError(
+            f"candidate result cv contains unexpected fields: {sorted(unexpected)}"
+        )
+    required = {"acc_10_mean", "median_ape_mean", "r2_mean"}
+    missing = required.difference(value)
+    if missing:
+        raise ValueError(
+            f"candidate result cv is missing rank fields: {sorted(missing)}"
+        )
+    return {
+        key: _validated_candidate_number(value[key], f"cv.{key}")
+        for key in sorted(value)
+    }
+
+
+def _validated_candidate_index_groups(
+    value: Any,
+    path: str,
+    development_ids: set[int],
+) -> list[list[int]]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"candidate result {path} must be a list of row-ID lists")
+    groups = []
+    for group_index, group in enumerate(value):
+        if not isinstance(group, (list, tuple)):
+            raise TypeError(
+                f"candidate result {path}[{group_index}] must be a row-ID list"
+            )
+        row_ids = []
+        for row_id in group:
+            if isinstance(row_id, bool) or not isinstance(row_id, Integral):
+                raise TypeError(f"candidate result {path} must contain integer row IDs")
+            row_ids.append(int(row_id))
+        if not set(row_ids).issubset(development_ids):
+            raise ValueError(
+                f"candidate result {path} contains rows outside development"
+            )
+        groups.append(row_ids)
+    return groups
+
+
+def _validated_candidate_result(
+    result: Mapping[str, Any],
+    candidate: CandidateConfig,
+    collection_year: int,
+    development_ids: set[int],
+) -> dict[str, Any]:
+    if not isinstance(result, Mapping):
+        raise TypeError("candidate result must be an object")
+    allowed = set(_CANDIDATE_RESULT_FIELDS)
+    if candidate.model_type == "catboost":
+        allowed.add("best_iterations")
+    unexpected = set(result).difference(allowed)
+    if unexpected:
+        raise ValueError(
+            "candidate result contains unexpected or post-selection fields: "
+            f"{sorted(unexpected)}"
+        )
+    missing = set(_CANDIDATE_RESULT_FIELDS).difference(result)
+    if missing:
+        raise ValueError(f"candidate result is missing fields: {sorted(missing)}")
+
+    expected_candidate = candidate.to_dict()
+    if result["name"] != candidate.name or result["model_type"] != candidate.model_type:
+        raise ValueError("candidate result identity does not match evaluated candidate")
+    if result["complexity"] != candidate.complexity:
+        raise ValueError("candidate result complexity does not match evaluated candidate")
+    if result["collection_year"] != collection_year:
+        raise ValueError("candidate result collection_year does not match competition")
+    if _json_value(result["config"]) != expected_candidate["params"]:
+        raise ValueError("candidate result config does not match evaluated candidate")
+    if _json_value(result["candidate"]) != expected_candidate:
+        raise ValueError("candidate result candidate metadata does not match evaluated candidate")
+
+    fold_metrics = result["fold_metrics"]
+    if not isinstance(fold_metrics, (list, tuple)):
+        raise TypeError("candidate result fold_metrics must be a list")
+    projected = {
+        "name": candidate.name,
+        "model_type": candidate.model_type,
+        "config": expected_candidate["params"],
+        "complexity": candidate.complexity,
+        "collection_year": collection_year,
+        "candidate": expected_candidate,
+        "fold_metrics": [
+            _validated_candidate_metrics(metrics, f"fold_metrics[{index}]")
+            for index, metrics in enumerate(fold_metrics)
+        ],
+        "cv": _validated_candidate_cv(result["cv"]),
+        "observed_train_indices": _validated_candidate_index_groups(
+            result["observed_train_indices"],
+            "observed_train_indices",
+            development_ids,
+        ),
+        "observed_validation_indices": _validated_candidate_index_groups(
+            result["observed_validation_indices"],
+            "observed_validation_indices",
+            development_ids,
+        ),
+    }
+    if "best_iterations" in result:
+        values = result["best_iterations"]
+        if not isinstance(values, (list, tuple)) or any(
+            value is not None
+            and (isinstance(value, bool) or not isinstance(value, Integral))
+            for value in values
+        ):
+            raise TypeError("candidate result best_iterations must contain integers or null")
+        projected["best_iterations"] = [
+            None if value is None else int(value) for value in values
+        ]
+    return projected
 
 
 def run_competition(
@@ -225,16 +415,34 @@ def run_competition(
     if not candidates:
         raise ValueError("candidates must contain at least one configuration")
     evaluator = evaluator or evaluate_candidate
+    development_ids = [int(value) for value in manifest["development"]]
+    if len(development_ids) != len(set(development_ids)):
+        raise ValueError("manifest development must contain unique row IDs")
+    missing_development = set(development_ids).difference(
+        int(value) for value in frame.index
+    )
+    if missing_development:
+        raise ValueError("manifest development row IDs must exist in frame")
+    development_frame = frame.loc[development_ids].copy()
+    sealed_manifest = _SealedCompetitionManifest(manifest)
+    development_set = set(development_ids)
     leaderboard = []
     for candidate in candidates:
         result = evaluator(
-            frame,
-            manifest,
+            development_frame.copy(),
+            sealed_manifest,
             candidate,
             collection_year=collection_year,
             seed=seed,
         )
-        leaderboard.append(_without_post_selection_fields(result))
+        leaderboard.append(
+            _validated_candidate_result(
+                result,
+                candidate,
+                collection_year,
+                development_set,
+            )
+        )
     return leaderboard
 
 
@@ -595,18 +803,30 @@ def build_artifacts(
     output_dir.mkdir(parents=True, exist_ok=False)
     frame = experiment["frame"]
     manifest = _json_value(experiment["split_manifest"])
+    seed = int(experiment["seed"])
+    collection_year = _validate_collection_year(experiment["collection_year"])
+    development_ids = {int(value) for value in manifest["development"]}
     leaderboard = [
-        _without_post_selection_fields(result)
+        _validated_candidate_result(
+            result,
+            _winner_config(result),
+            collection_year,
+            development_ids,
+        )
         for result in experiment["leaderboard"]
     ]
-    winner = _without_post_selection_fields(experiment["winner"])
+    winner_source = experiment["winner"]
+    winner = _validated_candidate_result(
+        winner_source,
+        _winner_config(winner_source),
+        collection_year,
+        development_ids,
+    )
     fitted = experiment["fitted_model"]
     refit = _json_value(experiment.get("refit") or _refit_metadata(fitted))
     holdout = experiment["holdout"]
     metrics = _json_value(holdout["metrics"])
     gate = _json_value(experiment["gate"])
-    seed = int(experiment["seed"])
-    collection_year = _validate_collection_year(experiment["collection_year"])
     run_id = str(experiment["run_id"])
     model_version = str(experiment.get("model_version", f"v3-{run_id}"))
     created_at = str(experiment["created_at"])
@@ -766,6 +986,21 @@ def build_artifacts(
         "collection_year": collection_year,
         "seed": seed,
         "provenance": provenance,
+        "data_source": provenance,
+        "currency": "INR",
+        "price_unit": "INR",
+        "mileage_unit": "km",
+        "sample_count": counts["total"],
+        "split": {
+            "train": len(split_indices["train"]),
+            "validation": len(split_indices["validation"]),
+            "development": counts["development"],
+            "test": counts["test"],
+        },
+        "thresholds": gate["thresholds"],
+        "quality_gate": gate["quality_gate"],
+        "warnings": gate["warnings"],
+        "test_metrics": metrics,
         "units": units,
         "counts": counts,
         "created_at": created_at,
@@ -887,8 +1122,16 @@ def publish_experiment(
     formal_dir: str | Path,
 ) -> bool:
     """Publish a passing experiment copy with backup and rollback."""
-    experiment_dir = Path(experiment_dir)
-    formal_dir = Path(formal_dir)
+    experiment_dir = Path(experiment_dir).resolve(strict=True)
+    formal_dir = Path(formal_dir).resolve(strict=False)
+    if (
+        experiment_dir == formal_dir
+        or experiment_dir.is_relative_to(formal_dir)
+        or formal_dir.is_relative_to(experiment_dir)
+    ):
+        raise ValueError(
+            "experiment and formal model directories must not be equal, ancestor, or descendant"
+        )
     metrics = _read_json(experiment_dir / "metrics.json")
     if metrics.get("quality_gate") != "pass":
         return False
@@ -903,8 +1146,6 @@ def publish_experiment(
         return False
 
     _validate_experiment_directory(experiment_dir)
-    if experiment_dir.resolve() == formal_dir.resolve():
-        raise ValueError("experiment and formal model directories must be different")
     formal_dir.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
     staging_dir = formal_dir.with_name(f".{formal_dir.name}.staging-{token}")

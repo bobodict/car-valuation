@@ -8,8 +8,11 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pandas as pd
 
+from schemas import ModelCardResponse
 from scripts import train_model
 from services.model_competition import CandidateConfig
+from services.model_metadata import load_model_card
+from services.split_service import build_split_manifest
 
 
 def make_fixture_frame(size=30):
@@ -69,6 +72,7 @@ def candidate_result(name="tiny-tree", model_type="extra_trees"):
         "model_type": config.model_type,
         "config": dict(config.params),
         "complexity": config.complexity,
+        "collection_year": 2026,
         "candidate": config.to_dict(),
         "cv": {
             "acc_10_mean": 0.75,
@@ -81,6 +85,8 @@ def candidate_result(name="tiny-tree", model_type="extra_trees"):
             "rmse_std": 500.0,
         },
         "fold_metrics": [],
+        "observed_train_indices": [],
+        "observed_validation_indices": [],
     }
 
 
@@ -123,7 +129,7 @@ def make_fixture_experiment():
                 {"fold": 0, "train": [0, 1, 2, 3], "validation": [4, 5, 6, 7]}
             ],
         },
-        "leaderboard": [{**winner, "test_metrics": {"acc_10": 0.0}}],
+        "leaderboard": [winner],
         "winner": winner,
         "fitted_model": SavingAdapter(),
         "refit": {
@@ -239,6 +245,35 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertEqual(manifest["model_type"], "extra_trees")
             self.assertEqual(manifest["model_artifacts"], {"bundle": "winner.bin"})
 
+    def test_generated_model_card_supports_current_consumers_and_keeps_v3_evidence(self):
+        build_artifacts = self.require_function("build_artifacts")
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "experiment"
+            build_artifacts(make_fixture_experiment(), output_dir)
+
+            try:
+                card = load_model_card(output_dir / "model_card.json")
+                response = ModelCardResponse.model_validate(card)
+            except Exception as exc:
+                self.fail(f"generated model card failed current consumers: {exc}")
+
+            self.assertEqual(card["currency"], "INR")
+            self.assertEqual(card["price_unit"], "INR")
+            self.assertEqual(card["mileage_unit"], "km")
+            self.assertEqual(card["sample_count"], 12)
+            self.assertEqual(card["data_source"], {"source_id": "unit-test"})
+            self.assertEqual(
+                card["split"],
+                {"train": 8, "validation": 0, "development": 8, "test": 4},
+            )
+            self.assertEqual(card["thresholds"], {"min_r2": 0.0, "min_acc_10": 0.5})
+            self.assertEqual(card["quality_gate"], "pass")
+            self.assertEqual(card["warnings"], [])
+            self.assertEqual(card["test_metrics"]["rmse"], 10.0)
+            self.assertEqual(response.model_version, "v3-run-fixture")
+            self.assertIn("cv_selection", card)
+            self.assertIn("independent_holdout", card)
+
     def test_quality_gate_is_fixed_strict_and_rejects_nonfinite_metrics(self):
         passing = train_model.assess_quality_gate(
             {"r2": 0.1, "acc_10": 0.5, "rmse": 9.99, "baseline_rmse": 10.0}
@@ -275,39 +310,191 @@ class TrainingPipelineTests(unittest.TestCase):
         self.assertEqual(result["quality_gate"], "fail")
         self.assertEqual(result["thresholds"], {"min_r2": 0.0, "min_acc_10": 0.5})
 
-    def test_run_competition_and_selection_do_not_expose_test_metrics(self):
+    def test_run_competition_rejects_post_selection_result_fields(self):
         run_competition = self.require_function("run_competition")
-        select_winner = self.require_function("select_winner")
         candidate = CandidateConfig(
             "tiny-tree",
             "extra_trees",
-            {"n_estimators": 1, "min_samples_leaf": 1, "max_features": 1.0},
+            {"n_estimators": 1, "min_samples_leaf": 1, "max_features": 1.0, "n_jobs": 1},
             1,
         )
         evaluated = {**candidate_result(), "test_metrics": {"acc_10": 1.0}}
         evaluator = Mock(return_value=evaluated)
 
-        leaderboard = run_competition(
-            make_fixture_frame(12),
-            {"development": list(range(10)), "test": [10, 11], "folds": []},
-            [candidate],
+        with self.assertRaisesRegex(ValueError, "unexpected|post-selection"):
+            run_competition(
+                make_fixture_frame(12),
+                {"development": list(range(10)), "test": [10, 11], "folds": []},
+                [candidate],
+                seed=42,
+                collection_year=2026,
+                evaluator=evaluator,
+            )
+
+    def test_outer_test_value_changes_cannot_change_competition_or_winner(self):
+        run_competition = self.require_function("run_competition")
+        select_winner = self.require_function("select_winner")
+        frame = make_fixture_frame(14)
+        manifest = {
+            "development": list(range(12)),
+            "test": [12, 13],
+            "folds": [],
+        }
+        altered = frame.copy(deep=True)
+        altered.loc[manifest["test"], "price"] = [90_000_000.0, 99_000_000.0]
+        altered.loc[manifest["test"], "mileage"] = [8_000_000.0, 9_000_000.0]
+        altered.loc[manifest["test"], "model"] = ["Outer Secret A", "Outer Secret B"]
+        candidates = [
+            CandidateConfig(
+                name,
+                "extra_trees",
+                {"n_estimators": 1, "min_samples_leaf": 1, "max_features": 1.0, "n_jobs": 1},
+                complexity,
+            )
+            for name, complexity in (("alpha", 1), ("beta", 2))
+        ]
+        observed_indices = []
+
+        def evaluator(development_frame, sealed_manifest, config, **kwargs):
+            observed_indices.append(development_frame.index.tolist())
+            checksum = float(
+                development_frame["price"].sum()
+                + development_frame["mileage"].sum()
+            )
+            result = candidate_result(config.name)
+            result["config"] = dict(config.params)
+            result["complexity"] = config.complexity
+            result["candidate"] = config.to_dict()
+            result["cv"]["rmse_mean"] = checksum
+            return result
+
+        first = run_competition(
+            frame,
+            manifest,
+            candidates,
+            seed=42,
+            collection_year=2026,
+            evaluator=evaluator,
+        )
+        second = run_competition(
+            altered,
+            manifest,
+            candidates,
             seed=42,
             collection_year=2026,
             evaluator=evaluator,
         )
 
-        self.assertNotIn("test_metrics", leaderboard[0])
-        with patch.object(train_model, "rank_candidates", return_value=leaderboard[0]) as rank:
-            winner = select_winner(leaderboard)
-        rank.assert_called_once_with(leaderboard)
-        self.assertIs(winner, leaderboard[0])
+        self.assertEqual(first, second)
+        self.assertEqual(select_winner(first)["name"], select_winner(second)["name"])
+        self.assertEqual(
+            observed_indices,
+            [manifest["development"]] * (len(candidates) * 2),
+        )
+
+    def test_malicious_competition_evaluator_cannot_retrieve_test_manifest_value(self):
+        run_competition = self.require_function("run_competition")
+        candidate = CandidateConfig(
+            "tiny-tree",
+            "extra_trees",
+            {"n_estimators": 1, "min_samples_leaf": 1, "max_features": 1.0, "n_jobs": 1},
+            1,
+        )
+        accepted_results = []
+
+        def malicious_evaluator(frame, manifest, config, **kwargs):
+            manifest["test"]
+            accepted_results.append(candidate_result())
+            return accepted_results[-1]
+
+        with self.assertRaisesRegex(RuntimeError, "sealed"):
+            run_competition(
+                make_fixture_frame(12),
+                {"development": list(range(10)), "test": [10, 11], "folds": []},
+                [candidate],
+                seed=42,
+                collection_year=2026,
+                evaluator=malicious_evaluator,
+            )
+
+        self.assertEqual(accepted_results, [])
+
+    def test_run_competition_rejects_nested_non_cv_evidence(self):
+        run_competition = self.require_function("run_competition")
+        candidate = CandidateConfig(
+            "tiny-tree",
+            "extra_trees",
+            {"n_estimators": 1, "min_samples_leaf": 1, "max_features": 1.0, "n_jobs": 1},
+            1,
+        )
+        evaluated = candidate_result()
+        evaluated["cv"]["diagnostics"] = {
+            "holdout_metrics": {"acc_10": 1.0},
+            "subgroup": {"unseen_model": "outer-secret"},
+        }
+
+        with self.assertRaisesRegex(ValueError, "cv|unexpected|post-selection"):
+            run_competition(
+                make_fixture_frame(12),
+                {"development": list(range(10)), "test": [10, 11], "folds": []},
+                [candidate],
+                seed=42,
+                collection_year=2026,
+                evaluator=Mock(return_value=evaluated),
+            )
+
+    def test_standard_candidate_evaluator_works_with_sealed_manifest(self):
+        run_competition = self.require_function("run_competition")
+        frame = make_fixture_frame(40)
+        manifest = build_split_manifest(frame, seed=42)
+        candidate = CandidateConfig(
+            "tiny-tree",
+            "extra_trees",
+            {
+                "n_estimators": 1,
+                "min_samples_leaf": 1,
+                "max_features": 1.0,
+                "n_jobs": 1,
+            },
+            1,
+        )
+
+        leaderboard = run_competition(
+            frame,
+            manifest,
+            [candidate],
+            seed=42,
+            collection_year=2026,
+        )
+
+        self.assertEqual(len(leaderboard), 1)
+        self.assertEqual(leaderboard[0]["name"], "tiny-tree")
+        self.assertEqual(
+            set().union(*map(set, leaderboard[0]["observed_validation_indices"])),
+            set(manifest["development"]),
+        )
+        self.assertTrue(
+            set(manifest["test"]).isdisjoint(
+                set().union(*map(set, leaderboard[0]["observed_train_indices"]))
+            )
+        )
+
+    def test_artifact_builder_rejects_nested_candidate_holdout_evidence(self):
+        build_artifacts = self.require_function("build_artifacts")
+        experiment = make_fixture_experiment()
+        experiment["leaderboard"][0]["cv"]["diagnostics"] = {
+            "test_metrics": {"rmse": 0.0}
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "cv|unexpected|post-selection"):
+                build_artifacts(experiment, Path(directory) / "experiment")
 
     def test_run_competition_resolves_patched_tiny_evaluator_at_call_time(self):
         run_competition = self.require_function("run_competition")
         candidate = CandidateConfig(
             "tiny-tree",
             "extra_trees",
-            {"n_estimators": 1, "min_samples_leaf": 1, "max_features": 1.0},
+            {"n_estimators": 1, "min_samples_leaf": 1, "max_features": 1.0, "n_jobs": 1},
             1,
         )
         with patch.object(
@@ -649,6 +836,63 @@ class TrainingPipelineTests(unittest.TestCase):
 
             self.assertEqual(marker.read_bytes(), b"formal-before")
             self.assertTrue(experiment.is_dir())
+
+    def test_publication_rejects_formal_directory_ancestor_of_experiment(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            formal = root / "models"
+            formal.mkdir()
+            formal_marker = formal / "formal-marker.bin"
+            formal_bytes = bytes(range(64))
+            formal_marker.write_bytes(formal_bytes)
+            experiment = formal / "experiments" / "run"
+            experiment.parent.mkdir()
+            write_publishable_experiment(experiment)
+            experiment_marker = experiment / "winner.bin"
+            experiment_bytes = experiment_marker.read_bytes()
+
+            with patch.object(
+                train_model.shutil,
+                "copytree",
+                side_effect=ValueError("copy attempted before relationship rejection"),
+            ) as copytree:
+                with self.assertRaisesRegex(ValueError, "ancestor|descendant"):
+                    publish_experiment(experiment, formal)
+
+            copytree.assert_not_called()
+            self.assertEqual(formal_marker.read_bytes(), formal_bytes)
+            self.assertEqual(experiment_marker.read_bytes(), experiment_bytes)
+            self.assertEqual(list(root.glob(".models.staging-*")), [])
+            self.assertEqual(list(root.glob(".models.backup-*")), [])
+
+    def test_publication_rejects_experiment_directory_ancestor_of_formal(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            write_publishable_experiment(experiment)
+            experiment_marker = experiment / "winner.bin"
+            experiment_bytes = experiment_marker.read_bytes()
+            formal = experiment / "formal"
+            formal.mkdir()
+            formal_marker = formal / "formal-marker.bin"
+            formal_bytes = bytes(reversed(range(64)))
+            formal_marker.write_bytes(formal_bytes)
+
+            with patch.object(
+                train_model.shutil,
+                "copytree",
+                side_effect=ValueError("copy attempted before relationship rejection"),
+            ) as copytree:
+                with self.assertRaisesRegex(ValueError, "ancestor|descendant"):
+                    publish_experiment(experiment, formal)
+
+            copytree.assert_not_called()
+            self.assertEqual(formal_marker.read_bytes(), formal_bytes)
+            self.assertEqual(experiment_marker.read_bytes(), experiment_bytes)
+            self.assertEqual(list(experiment.glob(".formal.staging-*")), [])
+            self.assertEqual(list(experiment.glob(".formal.backup-*")), [])
 
     def test_publication_rechecks_mislabeled_passing_gate(self):
         publish_experiment = self.require_function("publish_experiment")
