@@ -396,6 +396,10 @@
 
               </div>
 
+              <div v-if="modelHealth && modelHealth.quality_gate === 'fail'" class="error-banner" role="alert">
+                模型质量门禁未通过：{{ modelHealth.warnings.join(' ') }} 当前仅适合作为研究演示。
+              </div>
+
               <div class="chart-row">
                 <div class="chart-wrapper card">
                   <div class="card-header">
@@ -657,6 +661,7 @@ export default {
         date: ''
       },
       modelMetrics: null,
+      modelHealth: null,
       loading: {
         prediction: false,
         history: false,
@@ -767,11 +772,15 @@ switchPage(id) {
       this.loading.metrics = true;
       this.errors.metrics = '';
       try {
-        const resp = await fetch(`${API_BASE}/api/metrics`);
-        if (!resp.ok) {
-          throw new Error(`获取模型指标失败：${resp.status}`);
+        const [metricsResp, healthResp] = await Promise.all([
+          fetch(`${API_BASE}/api/metrics`),
+          fetch(`${API_BASE}/api/model-health`)
+        ]);
+        if (!metricsResp.ok || !healthResp.ok) {
+          throw new Error(`获取模型质量信息失败：${metricsResp.status}/${healthResp.status}`);
         }
-        this.modelMetrics = await resp.json();
+        this.modelMetrics = await metricsResp.json();
+        this.modelHealth = await healthResp.json();
       } catch (err) {
         console.error(err);
         this.errors.metrics = '模型测试指标加载失败，请检查后端服务。';

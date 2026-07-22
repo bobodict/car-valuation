@@ -58,6 +58,14 @@ class MetricsResponse(BaseModel):
     test_metrics: TestMetrics
 
 
+class ModelHealthResponse(BaseModel):
+    model_status: Literal["experimental"]
+    quality_gate: Literal["pass", "fail"]
+    warnings: list[str] = Field(default_factory=list)
+    metrics: TestMetrics
+    data_status: str
+
+
 class AssistantRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 

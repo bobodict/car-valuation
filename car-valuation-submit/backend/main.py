@@ -15,6 +15,7 @@ from schemas import (
     AssistantResponse,
     HistoryOut,
     HistoryQuery,
+    ModelHealthResponse,
     MetricsResponse,
     PredictRequest,
     PredictResponse,
@@ -23,6 +24,7 @@ from services.assistant_service import answer_user_message
 from services.llm_client import LLMClientError, LLMNotConfiguredError
 from services.metrics_service import load_metrics
 from services.model_service import ModelServiceError, call_model_api
+from services.model_quality_service import get_model_health
 
 
 Base.metadata.create_all(bind=engine)
@@ -88,6 +90,11 @@ def get_history(
 @app.get("/api/metrics", response_model=MetricsResponse)
 def get_metrics():
     return load_metrics()
+
+
+@app.get("/api/model-health", response_model=ModelHealthResponse)
+def model_health():
+    return get_model_health()
 
 
 @app.post("/api/assistant", response_model=AssistantResponse)
