@@ -9,14 +9,20 @@ def assess_metrics(metrics: dict) -> dict:
     acc_10 = metrics.get("acc_10")
 
     if r2 is None or not math.isfinite(float(r2)):
-        warnings.append("R² 缺失或无效，无法判断模型是否优于均值基线。")
+        warnings.append(
+            "R2 is missing or invalid; model quality cannot be compared with the mean baseline."
+        )
     elif float(r2) < 0:
-        warnings.append("R² 小于 0，当前模型在测试集上不如简单均值基线。")
+        warnings.append(
+            "R2 is below 0; the model underperforms a simple mean baseline on the test set."
+        )
 
     if acc_10 is None or not math.isfinite(float(acc_10)):
-        warnings.append("10% 误差命中率缺失或无效。")
+        warnings.append("The 10% error hit rate is missing or invalid.")
     elif float(acc_10) < 0.5:
-        warnings.append("10% 误差命中率低于 50%，不应宣传高准确率。")
+        warnings.append(
+            "The 10% error hit rate is below 50%; do not claim high accuracy."
+        )
 
     return {
         "quality_gate": "fail" if warnings else "pass",

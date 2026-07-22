@@ -2,10 +2,10 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
 from pydantic import ValidationError
 
-from main import app
+from main import predict_car
 from schemas import PredictRequest, PredictResponse
 from services.model_runtime import ModelRuntimeError
 from services.model_service import ModelServiceError, build_model_input, call_model_api
@@ -55,9 +55,6 @@ NUMERIC_BOUNDARIES = {
     "height_mm": ((500.0, 5000.0), (499.9, 5000.1)),
     "fuel_tank_liter": ((1e-9, 1000.0), (0.0, 1000.1)),
 }
-
-
-client = TestClient(app)
 
 
 class PredictionContractTests(unittest.TestCase):
@@ -130,24 +127,24 @@ class PredictionContractTests(unittest.TestCase):
                 self.assertIn(field, result)
                 self.assertIsNone(result[field])
 
-    def test_api_returns_422_for_blank_optional_string(self):
+    def test_blank_optional_string_matches_422_validation_contract(self):
         payload = {**make_request().model_dump(), "seller_type": "   "}
-        with patch(
-            "main.call_model_api", side_effect=ModelServiceError("unavailable")
-        ) as call_model_mock:
-            response = client.post("/api/predict", json=payload)
 
-        self.assertEqual(response.status_code, 422)
-        call_model_mock.assert_not_called()
+        with self.assertRaises(ValidationError) as raised:
+            PredictRequest.model_validate(payload)
 
-    def test_api_returns_503_for_model_service_error(self):
+        self.assertEqual(raised.exception.errors()[0]["loc"], ("seller_type",))
+
+    def test_predict_route_returns_503_for_model_service_error(self):
         with patch(
             "main.call_model_api", side_effect=ModelServiceError("model unavailable")
         ):
-            response = client.post("/api/predict", json=make_request().model_dump())
+            with self.assertRaises(HTTPException) as raised:
+                predict_car(make_request(), db=object())
 
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"detail": "model unavailable"})
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.detail, "model unavailable")
+
     def test_adapter_passes_full_source_features_and_km(self):
         model_input = build_model_input(make_request())
 

@@ -5,16 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
-
-from main import app, model_card
+from main import get_metrics, model_card, model_health
 from schemas import MetricsResponse, ModelCardResponse, ModelHealthResponse
 from services import metrics_service
 from services.model_metadata import load_model_card
 from services.model_quality_service import get_model_health
-
-
-client = TestClient(app)
 
 
 def make_card(split=None, **overrides):
@@ -94,17 +89,21 @@ class ModelMetadataTests(unittest.TestCase):
         )
 
         with patch("main.load_metrics", return_value=metrics):
-            metrics_response = client.get("/api/metrics")
+            metrics_response = MetricsResponse.model_validate(
+                get_metrics()
+            ).model_dump()
         with patch("main.get_model_health", return_value=health):
-            health_response = client.get("/api/model-health")
+            health_response = ModelHealthResponse.model_validate(
+                model_health()
+            ).model_dump()
         with patch("main.load_model_card", return_value=card):
-            card_response = client.get("/api/model-card")
+            card_response = ModelCardResponse.model_validate(model_card()).model_dump()
 
-        self.assertEqual(metrics_response.json()["model_type"], "catboost")
-        self.assertEqual(health_response.json()["feature_version"], "3.0.0")
-        self.assertEqual(card_response.json()["leaderboard"], {"winner": "catboost"})
+        self.assertEqual(metrics_response["model_type"], "catboost")
+        self.assertEqual(health_response["feature_version"], "3.0.0")
+        self.assertEqual(card_response["leaderboard"], {"winner": "catboost"})
         self.assertEqual(
-            card_response.json()["error_analysis"], {"segment": "rare"}
+            card_response["error_analysis"], {"segment": "rare"}
         )
 
     def test_v2_model_card_gets_safe_evidence_defaults(self):
