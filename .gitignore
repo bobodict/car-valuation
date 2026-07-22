@@ -22,6 +22,7 @@ backend/data/raw/
 backend/data/processed/
 backend/data/*.csv
 backend/*.db
+backend/experiments/
 
 # Local artifacts and duplicated working copies
 car-valuation-submit.zip
