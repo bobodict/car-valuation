@@ -1,8 +1,0 @@
-.superpowers/
-backend/data/raw/
-backend/data/processed/
-backend/data/*.csv
-backend/.env
-backend/*.db
-frontend/node_modules/
-frontend/dist/

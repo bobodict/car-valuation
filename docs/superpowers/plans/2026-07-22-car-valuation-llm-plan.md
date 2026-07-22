@@ -13,7 +13,7 @@
 ### Task 1: Add failing LLM tests
 
 **Files:**
-- Create: `car-valuation-submit/backend/tests/test_llm_contract.py`
+- Create: `backend/tests/test_llm_contract.py`
 
 - [ ] Test keyword retrieval returns source records.
 - [ ] Test an unconfigured client raises `LLMNotConfiguredError`.
@@ -23,10 +23,10 @@
 ### Task 2: Add LLM configuration, schemas, and knowledge retrieval
 
 **Files:**
-- Modify: `car-valuation-submit/backend/config.py`
-- Modify: `car-valuation-submit/backend/schemas.py`
-- Create: `car-valuation-submit/backend/services/knowledge_service.py`
-- Create: `car-valuation-submit/backend/data/knowledge_base.json`
+- Modify: `backend/config.py`
+- Modify: `backend/schemas.py`
+- Create: `backend/services/knowledge_service.py`
+- Create: `backend/data/knowledge_base.json`
 
 - [ ] Add provider URL, key, model, timeout, and knowledge path settings.
 - [ ] Add assistant request/response, citation, and optional estimate schemas.
@@ -36,9 +36,9 @@
 ### Task 3: Implement provider client and assistant tool loop
 
 **Files:**
-- Create: `car-valuation-submit/backend/services/llm_client.py`
-- Create: `car-valuation-submit/backend/services/assistant_service.py`
-- Test: `car-valuation-submit/backend/tests/test_llm_contract.py`
+- Create: `backend/services/llm_client.py`
+- Create: `backend/services/assistant_service.py`
+- Test: `backend/tests/test_llm_contract.py`
 
 - [ ] Implement standard-library HTTP calls to `/chat/completions` with injectable transport for tests.
 - [ ] Define the `estimate_vehicle` tool schema.
@@ -49,9 +49,9 @@
 ### Task 4: Expose assistant API and configuration docs
 
 **Files:**
-- Modify: `car-valuation-submit/backend/main.py`
-- Modify: `car-valuation-submit/backend/.env.example`
-- Modify: `car-valuation-submit/backend/README.md`
+- Modify: `backend/main.py`
+- Modify: `backend/.env.example`
+- Modify: `backend/README.md`
 
 - [ ] Add `POST /api/assistant` with 503 for disabled configuration and 502 for provider failures.
 - [ ] Document provider setup, tool flow, knowledge citations, and offline behavior.
@@ -60,8 +60,8 @@
 ### Task 5: Add the assistant frontend surface
 
 **Files:**
-- Modify: `car-valuation-submit/frontend/src/App.vue`
-- Modify: `car-valuation-submit/frontend/Readme.md`
+- Modify: `frontend/src/App.vue`
+- Modify: `frontend/Readme.md`
 
 - [ ] Add an assistant navigation page with message history, loading/error states, estimate output, and citations.
 - [ ] Keep the assistant visibly separate from numeric model metrics and show disabled state when no provider is configured.

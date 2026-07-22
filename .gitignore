@@ -17,8 +17,15 @@ node_modules/
 dist/
 .vite/
 
+# Downloaded training data and local databases
+backend/data/raw/
+backend/data/processed/
+backend/data/*.csv
+backend/*.db
+
 # Local artifacts and duplicated working copies
 car-valuation-submit.zip
+car-valuation-submit/
 qianduan/
 /models/
 /services/
@@ -34,3 +41,4 @@ qianduan/
 *.code-workspace
 .DS_Store
 Thumbs.db
+.superpowers/

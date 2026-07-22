@@ -22,7 +22,7 @@
   "data_source": {
     "source_id": "car-details-v4",
     "source_url": "https://raw.githubusercontent.com/chandanverma07/DataSets/master/car%20details%20v4.csv",
-    "raw_path": "D:\\car-valuation\\car-valuation-submit\\backend\\data\\raw\\car-details-v4.csv",
+    "raw_path": "D:\\car-valuation\\backend\\data\\raw\\car-details-v4.csv",
     "retrieved_at": "2026-07-22T12:15:52.447380+00:00",
     "sha256": "6841a81165c2a390d84b361555489e123f739f0e4b2bfe7915e759746b3efe59",
     "byte_count": 352832

@@ -8,9 +8,8 @@ from dotenv import load_dotenv
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BACKEND_DIR.parent
-REPOSITORY_DIR = PROJECT_DIR.parent
 
-for env_path in (BACKEND_DIR / ".env", REPOSITORY_DIR / ".env"):
+for env_path in (BACKEND_DIR / ".env", PROJECT_DIR / ".env"):
     if env_path.exists():
         load_dotenv(env_path, override=False)
 
