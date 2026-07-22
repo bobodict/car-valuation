@@ -116,6 +116,17 @@ def _validate_collection_year(value: Any) -> int:
     return int(value)
 
 
+def _validated_v3_model_version(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value.startswith("v3-")
+        or len(value) <= len("v3-")
+    ):
+        raise ValueError("model_version must match the nonempty v3- artifact identity")
+    return value
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         normalized = {}
@@ -400,11 +411,69 @@ def _validated_candidate_index_groups(
     return groups
 
 
+def _validated_candidate_fold_evidence(
+    result: Mapping[str, Any],
+    development_ids: set[int],
+    expected_folds: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, float]], dict[str, float], list[list[int]], list[list[int]]]:
+    fold_metrics_value = result["fold_metrics"]
+    if not isinstance(fold_metrics_value, (list, tuple)):
+        raise TypeError("candidate result fold_metrics must be a list")
+    fold_metrics = [
+        _validated_candidate_metrics(metrics, f"fold_metrics[{index}]")
+        for index, metrics in enumerate(fold_metrics_value)
+    ]
+    observed_train = _validated_candidate_index_groups(
+        result["observed_train_indices"],
+        "observed_train_indices",
+        development_ids,
+    )
+    observed_validation = _validated_candidate_index_groups(
+        result["observed_validation_indices"],
+        "observed_validation_indices",
+        development_ids,
+    )
+    reported_cv = _validated_candidate_cv(result["cv"])
+
+    if not expected_folds:
+        if fold_metrics or observed_train or observed_validation:
+            raise ValueError("candidate fold evidence requires manifest folds")
+        return fold_metrics, reported_cv, observed_train, observed_validation
+
+    expected_train = [
+        [int(row_id) for row_id in fold["train"]] for fold in expected_folds
+    ]
+    expected_validation = [
+        [int(row_id) for row_id in fold["validation"]] for fold in expected_folds
+    ]
+    if (
+        len(fold_metrics) != len(expected_folds)
+        or observed_train != expected_train
+        or observed_validation != expected_validation
+    ):
+        raise ValueError("candidate fold evidence must exactly match manifest folds")
+    if any(set(metrics) != _CANDIDATE_METRICS for metrics in fold_metrics):
+        raise ValueError("candidate fold_metrics must contain all shared metrics")
+
+    canonical_cv = {}
+    for metric_name in sorted(_CANDIDATE_METRICS):
+        values = np.asarray(
+            [metrics[metric_name] for metrics in fold_metrics],
+            dtype=float,
+        )
+        canonical_cv[f"{metric_name}_mean"] = float(np.mean(values))
+        canonical_cv[f"{metric_name}_std"] = float(np.std(values))
+    if reported_cv != canonical_cv:
+        raise ValueError("candidate cv must equal canonical fold_metrics aggregation")
+    return fold_metrics, canonical_cv, observed_train, observed_validation
+
+
 def _validated_candidate_result(
     result: Mapping[str, Any],
     candidate: CandidateConfig,
     collection_year: int,
     development_ids: set[int],
+    expected_folds: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     if not isinstance(result, Mapping):
         raise TypeError("candidate result must be an object")
@@ -433,9 +502,13 @@ def _validated_candidate_result(
     if _json_value(result["candidate"]) != expected_candidate:
         raise ValueError("candidate result candidate metadata does not match evaluated candidate")
 
-    fold_metrics = result["fold_metrics"]
-    if not isinstance(fold_metrics, (list, tuple)):
-        raise TypeError("candidate result fold_metrics must be a list")
+    fold_metrics, cv, observed_train, observed_validation = (
+        _validated_candidate_fold_evidence(
+            result,
+            development_ids,
+            expected_folds,
+        )
+    )
     projected = {
         "name": candidate.name,
         "model_type": candidate.model_type,
@@ -443,21 +516,10 @@ def _validated_candidate_result(
         "complexity": candidate.complexity,
         "collection_year": collection_year,
         "candidate": expected_candidate,
-        "fold_metrics": [
-            _validated_candidate_metrics(metrics, f"fold_metrics[{index}]")
-            for index, metrics in enumerate(fold_metrics)
-        ],
-        "cv": _validated_candidate_cv(result["cv"]),
-        "observed_train_indices": _validated_candidate_index_groups(
-            result["observed_train_indices"],
-            "observed_train_indices",
-            development_ids,
-        ),
-        "observed_validation_indices": _validated_candidate_index_groups(
-            result["observed_validation_indices"],
-            "observed_validation_indices",
-            development_ids,
-        ),
+        "fold_metrics": fold_metrics,
+        "cv": cv,
+        "observed_train_indices": observed_train,
+        "observed_validation_indices": observed_validation,
     }
     if "best_iterations" in result:
         values = result["best_iterations"]
@@ -514,6 +576,7 @@ def run_competition(
                 candidate,
                 collection_year,
                 development_set,
+                manifest["folds"],
             )
         )
     return leaderboard
@@ -925,6 +988,7 @@ def build_artifacts(
             _winner_config(result),
             collection_year,
             development_ids,
+            manifest["folds"],
         )
         for result in experiment["leaderboard"]
     ]
@@ -934,6 +998,7 @@ def build_artifacts(
         _winner_config(winner_source),
         collection_year,
         development_ids,
+        manifest["folds"],
     )
     fitted = experiment["fitted_model"]
     refit = _json_value(experiment.get("refit") or _refit_metadata(fitted))
@@ -1472,6 +1537,7 @@ def _validate_feature_report_semantics(
 def _validate_error_analysis_semantics(
     error_analysis: Mapping[str, Any],
     test_count: int,
+    development_mean: float,
 ) -> None:
     price_quartiles = error_analysis.get("price_quartiles")
     family_frequency = error_analysis.get("model_family_frequency")
@@ -1518,6 +1584,17 @@ def _validate_error_analysis_semantics(
         )
         if group_count != test_count:
             raise ValueError(f"{name} counts must sum to the recorded test count")
+        expected_baseline_evidence = {
+            "kind": "development_mean",
+            "value_inr": development_mean,
+        }
+        if any(
+            group.get("baseline_evidence") != expected_baseline_evidence
+            for group in groups
+        ):
+            raise ValueError(
+                f"{name} subgroup baseline evidence must use the development mean"
+            )
 
 
 def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
@@ -1643,10 +1720,11 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
                 f"{report_name} is missing required fields: {sorted(missing)}"
             )
 
-    model_versions = {
-        payload.get("model_version") for payload in payloads.values()
-    }
-    if len(model_versions) != 1 or not next(iter(model_versions)):
+    model_version = _validated_v3_model_version(manifest.get("model_version"))
+    if any(
+        payload.get("model_version") != model_version
+        for payload in payloads.values()
+    ):
         raise ValueError("all experiment reports must agree on model_version")
     if {
         manifest["feature_version"],
@@ -1712,6 +1790,7 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
         _winner_config(manifest["winner"]),
         collection_year,
         development_ids,
+        split_manifest["folds"],
     )
     if model_card["winner"] != winner:
         raise ValueError("model manifest and model card winner records must agree")
@@ -1730,6 +1809,7 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
             _winner_config(candidate),
             collection_year,
             development_ids,
+            split_manifest["folds"],
         )
         for candidate in candidates
     ]
@@ -1816,6 +1896,10 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
         or not isinstance(error_baseline_evidence, Mapping)
         or error_baseline_evidence.get("source") != "development_only"
         or error_baseline_evidence.get("value_inr") != development_mean
+        or isinstance(refit.get("development_mean"), bool)
+        or not isinstance(refit.get("development_mean"), Real)
+        or not math.isfinite(float(refit["development_mean"]))
+        or float(refit["development_mean"]) != float(development_mean)
         or model_card["error_analysis"] != nested_error_analysis
     ):
         raise ValueError("experiment reports must agree on development baseline")
@@ -1835,6 +1919,7 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
     _validate_error_analysis_semantics(
         error_analysis,
         expected_split_counts["test"],
+        float(development_mean),
     )
     if (
         model_card["data_source"] != manifest["provenance"]
@@ -2031,14 +2116,45 @@ def _lock_payload(
     return payload
 
 
+def _is_publication_lock_token(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 32:
+        return False
+    try:
+        return uuid.UUID(hex=value).hex == value
+    except ValueError:
+        return False
+
+
+def _read_owned_publication_lock(lock: PublicationLock) -> dict[str, Any]:
+    _validate_publication_lock_path(lock.path, lock.formal_dir)
+    metadata_path = lock.path / PUBLICATION_LOCK_FILENAME
+    if metadata_path.is_symlink():
+        raise PermissionError("publication lock metadata must not be a symlink")
+    try:
+        metadata = _read_json(metadata_path)
+    except (OSError, TypeError, ValueError) as exc:
+        raise PermissionError("publication lock ownership cannot be verified") from exc
+    if (
+        not _is_publication_lock_token(metadata.get("token"))
+        or metadata["token"] != lock.token
+    ):
+        raise PermissionError("publication lock token is owned by another publisher")
+    return metadata
+
+
 def _mark_publication_lock(
     lock: PublicationLock,
     state: str,
     error: BaseException | None = None,
 ) -> Path:
     _validate_publication_lock_path(lock.path, lock.formal_dir)
+    metadata_path = lock.path / PUBLICATION_LOCK_FILENAME
+    if metadata_path.exists():
+        _read_owned_publication_lock(lock)
+    elif state != "active":
+        raise PermissionError("publication lock owner metadata is missing")
     return _write_json(
-        lock.path / PUBLICATION_LOCK_FILENAME,
+        metadata_path,
         _lock_payload(lock, state, error),
     )
 
@@ -2059,7 +2175,10 @@ def _recover_terminal_publication_lock(lock_dir: Path, formal_dir: Path) -> bool
         metadata = _read_json(metadata_path)
     except (OSError, TypeError, ValueError):
         return False
-    if metadata.get("state") not in {"completed", "failed"}:
+    if (
+        metadata.get("state") not in {"completed", "failed"}
+        or not _is_publication_lock_token(metadata.get("token"))
+    ):
         return False
     shutil.rmtree(lock_dir)
     return True
@@ -2098,7 +2217,7 @@ def _acquire_publication_lock(formal_dir: Path) -> PublicationLock:
 
 
 def _release_publication_lock(lock: PublicationLock) -> None:
-    _validate_publication_lock_path(lock.path, lock.formal_dir)
+    _read_owned_publication_lock(lock)
     shutil.rmtree(lock.path)
 
 
@@ -2210,6 +2329,8 @@ def _write_publication_warning(
 def publish_experiment(
     experiment_dir: str | Path,
     formal_dir: str | Path,
+    *,
+    smoke_loader: Callable[[Path, Mapping[str, Any]], Any] | None = None,
 ) -> bool:
     """Publish a passing experiment copy with backup and rollback."""
     requested_formal_dir = formal_dir
@@ -2266,6 +2387,7 @@ def publish_experiment(
                 or staged_gate["quality_gate"] != "pass"
             ):
                 raise ValueError("staged experiment must retain a passing quality gate")
+            smoke_load_experiment(staging_dir, loader=smoke_loader)
             if formal_dir.exists():
                 _rename_directory(formal_dir, backup_dir)
                 backup_created = True
@@ -2472,7 +2594,11 @@ def train_and_publish(
             _write_run_status(
                 experiment_dir, run_id, created_at, stage, "running"
             )
-            published = publish_experiment(experiment_dir, models_dir)
+            published = publish_experiment(
+                experiment_dir,
+                models_dir,
+                smoke_loader=smoke_loader,
+            )
             if not published:
                 rejection = RuntimeError(
                     "publication rejected a smoke-validated passing experiment"

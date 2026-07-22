@@ -40,6 +40,17 @@ def _is_v3(artifact: Mapping[str, Any]) -> bool:
     return str(artifact.get("artifact_version", "")).split(".", 1)[0] == "3"
 
 
+def _validated_v3_model_version(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value.startswith("v3-")
+        or len(value) <= len("v3-")
+    ):
+        raise ValueError("model_version must match the nonempty v3- artifact identity")
+    return value
+
+
 def _recorded_test_indices(frame, artifact: Mapping[str, Any]) -> list[int] | None:
     split_indices = artifact.get("split_indices")
     if not isinstance(split_indices, Mapping):
@@ -134,7 +145,17 @@ def _validate_v3_artifact_agreement(
 ) -> None:
     if not (_is_v3(manifest) or _is_v3(metrics_artifact)):
         return
-    for field in ("artifact_version", "model_version", "model_type"):
+    manifest_model_version = _validated_v3_model_version(
+        manifest.get("model_version")
+    )
+    metrics_model_version = _validated_v3_model_version(
+        metrics_artifact.get("model_version")
+    )
+    if manifest_model_version != metrics_model_version:
+        raise ValueError(
+            "v3 model_manifest.json and metrics.json must agree on model_version"
+        )
+    for field in ("artifact_version", "model_type"):
         manifest_value = manifest.get(field)
         metrics_value = metrics_artifact.get(field)
         if (

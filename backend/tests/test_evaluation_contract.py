@@ -108,6 +108,37 @@ class EvaluationContractTests(unittest.TestCase):
 
                 loader.assert_not_called()
 
+    def test_v3_model_version_requires_v3_artifact_identity_before_runtime(self):
+        frame = pd.DataFrame(
+            {
+                "price": [100.0, 200.0, 300.0, 400.0],
+                "model": ["A", "B", "C", "D"],
+            }
+        )
+        for invalid_version in (123, "legacy-fixture"):
+            with self.subTest(model_version=invalid_version), tempfile.TemporaryDirectory() as directory:
+                models_dir = Path(directory)
+                manifest, metrics = write_v3_artifacts(models_dir)
+                manifest["model_version"] = invalid_version
+                metrics["model_version"] = invalid_version
+                (models_dir / "model_manifest.json").write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+                (models_dir / "metrics.json").write_text(
+                    json.dumps(metrics), encoding="utf-8"
+                )
+                loader = Mock(side_effect=AssertionError("runtime must not load"))
+
+                with patch.object(evaluator, "load_dataset", return_value=frame):
+                    with self.assertRaisesRegex((TypeError, ValueError), "model_version"):
+                        evaluator.evaluate_model(
+                            "fixture.csv",
+                            models_dir=models_dir,
+                            runtime_loader=loader,
+                        )
+
+                loader.assert_not_called()
+
     def test_runtime_predictions_must_be_exactly_one_dimensional(self):
         frame = pd.DataFrame(
             {
