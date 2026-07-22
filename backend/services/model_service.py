@@ -1,13 +1,23 @@
 import math
 
-from predict_service import predict_price_one
+from predict_service import (
+    predict_price_one,
+    take_last_prediction_publication_state,
+)
 from schemas import PredictRequest
-from services.metrics_service import load_metrics
+from services.metrics_service import (
+    MetricsPublicationChanged,
+    load_metrics,
+    load_metrics_for_publication,
+)
 from services.model_runtime import ModelRuntimeError
 
 
 class ModelServiceError(RuntimeError):
     """Raised when the supplied model cannot produce a usable prediction."""
+
+
+_PREDICTION_BUNDLE_ATTEMPTS = 3
 
 
 def _normalize_gearbox(value: str) -> str:
@@ -57,11 +67,35 @@ def build_model_input(req: PredictRequest) -> dict:
     }
 
 
+def predict_price_one_with_identity(model_input: dict):
+    """Preserve legacy predictor injection while capturing runtime identity."""
+    take_last_prediction_publication_state()
+    raw_price = predict_price_one(model_input)
+    return raw_price, take_last_prediction_publication_state()
+
+
+def _prediction_bundle(model_input: dict) -> tuple[float, dict]:
+    for _ in range(_PREDICTION_BUNDLE_ATTEMPTS):
+        raw_price, publication = predict_price_one_with_identity(model_input)
+        if publication is None:
+            return float(raw_price), load_metrics()
+        identity, used_cached_runtime = publication
+        try:
+            metrics = load_metrics_for_publication(
+                identity, used_cached_runtime=used_cached_runtime
+            )
+        except MetricsPublicationChanged:
+            continue
+        return float(raw_price), metrics
+    raise ModelRuntimeError(
+        "model publication changed repeatedly while prediction metadata was loaded"
+    )
+
+
 def call_model_api(req: PredictRequest) -> dict:
     model_input = build_model_input(req)
     try:
-        raw_price = float(predict_price_one(model_input))
-        metrics = load_metrics()
+        raw_price, metrics = _prediction_bundle(model_input)
     except ModelRuntimeError as exc:
         raise ModelServiceError(
             "model service is unavailable; check model artifacts and runtime dependencies"

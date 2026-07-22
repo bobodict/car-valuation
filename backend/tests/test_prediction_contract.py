@@ -195,6 +195,60 @@ class PredictionContractTests(unittest.TestCase):
         self.assertEqual(response["model_type"], "mlp")
         self.assertEqual(response["feature_version"], "2.0.0")
 
+    def test_prediction_retries_instead_of_mixing_publication_identities(self):
+        class PublicationChangedForTest(RuntimeError):
+            pass
+
+        old_identity = ("publication", "old")
+        new_identity = ("publication", "new")
+        new_metrics = {
+            "quality_gate": "pass",
+            "currency": "INR",
+            "price_unit": "INR",
+            "mileage_unit": "km",
+            "model_version": "new-v3",
+            "model_type": "catboost",
+            "feature_version": "3.0.0",
+            "data_source": {"source_id": "test"},
+            "test_metrics": {
+                "mse": 1.0,
+                "rmse": 1.0,
+                "mae": 1.0,
+                "r2": 0.5,
+                "acc_10": 0.6,
+            },
+        }
+        with (
+            patch(
+                "services.model_service.predict_price_one_with_identity",
+                create=True,
+                side_effect=[
+                    (400000.0, (old_identity, False)),
+                    (600000.0, (new_identity, False)),
+                ],
+            ) as predict_snapshot,
+            patch(
+                "services.model_service.load_metrics_for_publication",
+                create=True,
+                side_effect=[
+                    PublicationChangedForTest("publication changed"),
+                    new_metrics,
+                ],
+            ),
+            patch(
+                "services.model_service.MetricsPublicationChanged",
+                PublicationChangedForTest,
+                create=True,
+            ),
+            patch("services.model_service.predict_price_one", return_value=400000.0),
+            patch("services.model_service.load_metrics", return_value=new_metrics),
+        ):
+            result = call_model_api(make_request())
+
+        self.assertEqual(result["price"], 600000.0)
+        self.assertEqual(result["model_version"], "new-v3")
+        self.assertEqual(predict_snapshot.call_count, 2)
+
     @patch(
         "services.model_service.predict_price_one",
         side_effect=ModelRuntimeError("failed at D:\\private\\models\\secret.pt"),

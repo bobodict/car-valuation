@@ -17,6 +17,7 @@ from schemas import (
 from services import metrics_service
 from services.model_metadata import load_model_card
 from services.model_quality_service import get_model_health
+from services.model_runtime import ModelRuntimeError
 from services.model_service import call_model_api
 
 
@@ -267,6 +268,8 @@ class ModelMetadataTests(unittest.TestCase):
             root = Path(directory)
             path = root / "metrics.json"
             replacement = root / "metrics.next.json"
+            old_identity = ("publication", "old")
+            new_identity = ("publication", "new")
             old_artifact = make_metrics(
                 artifact_version="3.0.0",
                 model_version="old-v3",
@@ -294,10 +297,23 @@ class ModelMetadataTests(unittest.TestCase):
 
             metrics_service.load_metrics.cache_clear()
             try:
-                with patch.object(
-                    metrics_service,
-                    "settings",
-                    SimpleNamespace(metrics_path=path),
+                with (
+                    patch.object(
+                        metrics_service,
+                        "settings",
+                        SimpleNamespace(metrics_path=path),
+                    ),
+                    patch.object(
+                        metrics_service,
+                        "get_model_publication_state",
+                        create=True,
+                        side_effect=[
+                            (old_identity, False),
+                            (old_identity, False),
+                            (new_identity, False),
+                            (new_identity, False),
+                        ],
+                    ) as publication_state,
                 ):
                     old_metrics = metrics_service.load_metrics()
                     replacement.replace(path)
@@ -311,6 +327,93 @@ class ModelMetadataTests(unittest.TestCase):
         self.assertEqual(new_metrics["model_type"], "new_type")
         self.assertEqual(new_metrics["feature_version"], "3.1.0")
         self.assertEqual(new_metrics["quality_gate"], "pass")
+        self.assertEqual(publication_state.call_count, 4)
+
+    def test_metrics_gap_uses_cached_snapshot_once_then_fails_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "models"
+            root.mkdir()
+            path = root / "metrics.json"
+            backup = parent / "models.backup"
+            identity = ("publication", "old")
+            new_identity = ("publication", "new")
+            path.write_text(
+                json.dumps(make_metrics(model_version="old-v3")), encoding="utf-8"
+            )
+
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with (
+                    patch.object(
+                        metrics_service,
+                        "settings",
+                        SimpleNamespace(metrics_path=path),
+                    ),
+                    patch.object(
+                        metrics_service,
+                        "get_model_publication_state",
+                        create=True,
+                        side_effect=[
+                            (identity, False),
+                            (identity, False),
+                            (identity, True),
+                            ModelRuntimeError("publication gap persisted"),
+                            (new_identity, False),
+                            (new_identity, False),
+                        ],
+                    ),
+                ):
+                    cached = metrics_service.load_metrics()
+                    root.rename(backup)
+                    outcomes = []
+                    for _ in range(2):
+                        try:
+                            outcomes.append(metrics_service.load_metrics())
+                        except Exception as exc:
+                            outcomes.append(exc)
+                    backup.rename(root)
+                    path.write_text(
+                        json.dumps(make_metrics(model_version="new-v3")),
+                        encoding="utf-8",
+                    )
+                    refreshed = metrics_service.load_metrics()
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        self.assertEqual(cached["model_version"], "old-v3")
+        self.assertIsInstance(outcomes[0], dict)
+        self.assertEqual(outcomes[0]["model_version"], "old-v3")
+        self.assertIsInstance(outcomes[1], ModelRuntimeError)
+        self.assertEqual(refreshed["model_version"], "new-v3")
+
+    def test_metrics_gap_without_validated_snapshot_fails_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing" / "metrics.json"
+            identity = ("publication", "missing")
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with (
+                    patch.object(
+                        metrics_service,
+                        "settings",
+                        SimpleNamespace(metrics_path=path),
+                    ),
+                    patch.object(
+                        metrics_service,
+                        "get_model_publication_state",
+                        create=True,
+                        return_value=(identity, True),
+                    ),
+                ):
+                    try:
+                        outcome = metrics_service.load_metrics()
+                    except Exception as exc:
+                        outcome = exc
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        self.assertIsInstance(outcome, ModelRuntimeError)
 
     def test_artifact_version_only_v3_metrics_flow_to_health_and_prediction(self):
         with tempfile.TemporaryDirectory() as directory:

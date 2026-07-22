@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import stat
 import threading
-from typing import Any
+from typing import Any, NamedTuple
 
 from config import settings
 from services.model_runtime import ModelRuntime, ModelRuntimeError
@@ -19,6 +19,11 @@ _identity_failure_count = 0
 
 _STALE_IDENTITY_FAILURE_LIMIT = 1
 _PUBLICATION_LOAD_ATTEMPTS = 3
+
+
+class ModelPublicationState(NamedTuple):
+    identity: tuple[Any, ...]
+    used_cached_runtime: bool
 
 
 def _file_stat(path: Path, identity_name: str) -> tuple[Any, ...]:
@@ -207,19 +212,20 @@ def _read_published_identity(models_dir: Path) -> tuple[Any, ...] | None:
     return identity
 
 
-def get_model_runtime() -> ModelRuntime:
-    """Return the runtime for the current complete published artifact identity."""
+def _get_model_runtime_snapshot() -> tuple[ModelRuntime, ModelPublicationState]:
     global _cached_identity, _cached_runtime
 
     models_dir = Path(settings.published_models_dir)
     with _runtime_lock:
         identity = _read_published_identity(models_dir)
         if identity is None:
-            return _cached_runtime
+            if _cached_runtime is None or _cached_identity is None:
+                raise ModelRuntimeError("no validated model publication is cached")
+            return _cached_runtime, ModelPublicationState(_cached_identity, True)
 
         for _ in range(_PUBLICATION_LOAD_ATTEMPTS):
             if _cached_runtime is not None and identity == _cached_identity:
-                return _cached_runtime
+                return _cached_runtime, ModelPublicationState(identity, False)
             try:
                 candidate = ModelRuntime.from_directory(models_dir)
             except MemoryError:
@@ -227,7 +233,13 @@ def get_model_runtime() -> ModelRuntime:
             except ModelRuntimeError:
                 current_identity = _read_published_identity(models_dir)
                 if current_identity is None:
-                    return _cached_runtime
+                    if _cached_runtime is None or _cached_identity is None:
+                        raise ModelRuntimeError(
+                            "no validated model publication is cached"
+                        )
+                    return _cached_runtime, ModelPublicationState(
+                        _cached_identity, True
+                    )
                 if current_identity != identity:
                     identity = current_identity
                     continue
@@ -235,16 +247,50 @@ def get_model_runtime() -> ModelRuntime:
 
             current_identity = _read_published_identity(models_dir)
             if current_identity is None:
-                return _cached_runtime
+                if _cached_runtime is None or _cached_identity is None:
+                    raise ModelRuntimeError("no validated model publication is cached")
+                return _cached_runtime, ModelPublicationState(
+                    _cached_identity, True
+                )
             if current_identity == identity:
                 _cached_runtime = candidate
                 _cached_identity = identity
-                return candidate
+                return candidate, ModelPublicationState(identity, False)
             identity = current_identity
 
         raise ModelRuntimeError(
             f"published model changed repeatedly while loading from {models_dir}"
         )
+
+
+_last_prediction_state = threading.local()
+
+
+def get_model_runtime() -> ModelRuntime:
+    """Return the runtime for the current complete published artifact identity."""
+    runtime, publication = _get_model_runtime_snapshot()
+    _last_prediction_state.value = publication
+    return runtime
+
+
+def get_model_publication_state() -> ModelPublicationState:
+    """Read the current identity without loading a new runtime."""
+    models_dir = Path(settings.published_models_dir)
+    with _runtime_lock:
+        identity = _read_published_identity(models_dir)
+        if identity is not None:
+            return ModelPublicationState(identity, False)
+        if _cached_runtime is None or _cached_identity is None:
+            raise ModelRuntimeError("no validated model publication is cached")
+        return ModelPublicationState(_cached_identity, True)
+
+
+def take_last_prediction_publication_state() -> ModelPublicationState | None:
+    """Return and clear publication state recorded by predict_price_one."""
+    publication = getattr(_last_prediction_state, "value", None)
+    if hasattr(_last_prediction_state, "value"):
+        del _last_prediction_state.value
+    return publication
 
 
 def clear_model_runtime_cache() -> None:
@@ -255,6 +301,7 @@ def clear_model_runtime_cache() -> None:
         _cached_runtime = None
         _cached_identity = None
         _identity_failure_count = 0
+        take_last_prediction_publication_state()
 
 
 def reload_model_runtime() -> ModelRuntime:
@@ -269,7 +316,16 @@ def reload_model_runtime() -> ModelRuntime:
 
 def predict_price_one(car_dict: Mapping[str, Any]) -> float:
     """Predict one vehicle price using the current published runtime."""
+    take_last_prediction_publication_state()
     return get_model_runtime().predict_one(car_dict)
+
+
+def predict_price_one_with_identity(
+    car_dict: Mapping[str, Any],
+) -> tuple[float, ModelPublicationState]:
+    """Predict with the exact runtime publication used for the result."""
+    runtime, publication = _get_model_runtime_snapshot()
+    return runtime.predict_one(car_dict), publication
 
 
 get_model_runtime.cache_clear = clear_model_runtime_cache
