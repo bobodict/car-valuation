@@ -19,10 +19,11 @@ Swagger is available at `http://127.0.0.1:8000/docs`.
 
 ## API
 
-- `POST /api/predict`: validates vehicle fields and returns a price in万元, a provisional reference range, real artifact metrics, and `model_status=experimental`.
+- `POST /api/predict`: validates vehicle fields and returns a raw INR price, a provisional reference range, real artifact metrics, and `model_status=experimental`.
 - `GET /api/history?limit=20`: returns up to 200 recent records.
 - `GET /api/metrics`: returns the test metrics stored in `models/metrics.json`.
 - `GET /api/model-health`: exposes the model quality gate and warnings derived from the stored metrics.
+- `GET /api/model-card`: returns dataset provenance, feature contract, split sizes, model version, and limitations.
 - `POST /api/assistant`: retrieves local knowledge and, when an LLM is configured, lets the model call the structured valuation tool and returns cited text.
 
 ## LLM assistant
@@ -31,7 +32,7 @@ The assistant uses an OpenAI-compatible `POST /chat/completions` endpoint. Set `
 
 Without those three settings, `/api/assistant` returns HTTP 503 with a clear disabled message. It never fabricates an offline answer. The model receives an `estimate_vehicle` tool and the backend validates its arguments before calling the numeric estimator.
 
-The supplied model is experimental. It has no calibrated confidence interval, and the project does not claim production accuracy. The training dataset and original training script are not part of this delivery yet.
+The supplied model is experimental. It has no calibrated confidence interval, and the project does not claim production accuracy. The public dataset adapter, downloader, training script, evaluation script, and model card are included for reproducibility.
 
 ## Reproducible evaluation
 

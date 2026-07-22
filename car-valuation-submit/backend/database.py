@@ -1,5 +1,5 @@
 # database.py
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker, declarative_base
 from config import settings
 
@@ -35,19 +35,28 @@ def get_db():
 
 
 def ensure_history_metadata_columns(db_engine=engine):
-    """Add non-destructive model metadata columns to an existing SQLite table."""
-    if db_engine.dialect.name != "sqlite":
+    """Add non-destructive model metadata columns to an existing history table."""
+    inspector = inspect(db_engine)
+    if not inspector.has_table("history"):
         return
-    with db_engine.begin() as connection:
-        columns = {
-            row[1]
-            for row in connection.exec_driver_sql("PRAGMA table_info(history)").fetchall()
-        }
+
+    existing_columns = {column["name"] for column in inspector.get_columns("history")}
+    missing_columns = [
+        (column_name, column_type)
         for column_name, column_type in (
             ("currency", "VARCHAR(16)"),
             ("model_version", "VARCHAR(64)"),
-        ):
-            if column_name not in columns:
-                connection.exec_driver_sql(
-                    f'ALTER TABLE history ADD COLUMN "{column_name}" {column_type}'
-                )
+        )
+        if column_name not in existing_columns
+    ]
+    if not missing_columns:
+        return
+
+    preparer = db_engine.dialect.identifier_preparer
+    table_name = preparer.quote("history")
+    with db_engine.begin() as connection:
+        for column_name, column_type in missing_columns:
+            quoted_column = preparer.quote(column_name)
+            connection.exec_driver_sql(
+                f"ALTER TABLE {table_name} ADD COLUMN {quoted_column} {column_type} NULL"
+            )

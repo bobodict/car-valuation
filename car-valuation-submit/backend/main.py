@@ -33,7 +33,7 @@ Base.metadata.create_all(bind=engine)
 ensure_history_metadata_columns(engine)
 
 app = FastAPI(
-    title="二手车价格预测系统后端",
+    title="车辆估值研究服务",
     description="提供实验性二手车估值、历史记录和模型指标接口。",
     version="1.1.0",
 )
@@ -55,7 +55,7 @@ def predict_car(body: PredictRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     history = History(
-        model=body.model or f"{body.brand}车型",
+        model=body.model or f"{body.brand} 车型",
         city=body.city,
         mileage=body.mileage,
         year=body.year,
@@ -119,7 +119,7 @@ def assistant(body: AssistantRequest):
 
 @app.get("/")
 def home():
-    return {"message": "二手车价格预测系统后端运行正常。"}
+    return {"message": "车辆估值后端运行正常。"}
 
 
 if __name__ == "__main__":

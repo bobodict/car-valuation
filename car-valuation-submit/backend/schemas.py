@@ -170,3 +170,13 @@ class HistoryOut(BaseModel):
     status: str
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def default_currency_for_legacy_rows(cls, value):
+        return value or "INR"
+
+    @field_validator("model_version", mode="before")
+    @classmethod
+    def default_model_version_for_legacy_rows(cls, value):
+        return value or "unknown"

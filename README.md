@@ -14,7 +14,7 @@ The assistant upgrade adds a local auditable knowledge base and an optional Open
 
 ## Current Model Status
 
-The supplied model is an experimental artifact. Its recorded holdout metrics are kept in `backend/models/metrics.json`; the project does not claim production accuracy or calibrated confidence. Training data and the original training script are not included yet.
+The supplied model is an experimental artifact. Its recorded holdout metrics are kept in `car-valuation-submit/backend/models/metrics.json`; the project does not claim production accuracy or calibrated confidence. The public dataset, adapter, downloader, training script, evaluation script, and model card are included for reproducibility. The current test R2 is 0.8636, but the 10% error accuracy is 29.1%, so the quality gate remains failed.
 
 ## Local Setup
 

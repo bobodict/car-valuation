@@ -11,8 +11,8 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-The API base URL is read from `VITE_API_BASE` and defaults to `http://127.0.0.1:8000`.
+The API base URL is read from `VITE_API_BASE_URL` (or the legacy `VITE_API_BASE`) and defaults to the same-origin path. For local Vite development, run the backend at `http://127.0.0.1:8000` and set `VITE_API_BASE_URL=http://127.0.0.1:8000` in `.env`.
 
-The 大模型助手页面 is available when the backend has `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` configured. Without them, the page shows the disabled provider state.
+The explanation assistant is available when the backend has `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` configured. Without them, the page shows the disabled provider state.
 
 `npm run build` creates the production bundle in `dist`.
