@@ -371,7 +371,9 @@ def _validated_evaluation_folds(
     if config.model_type not in {"catboost", "extra_trees", "mlp"}:
         raise ValueError(f"unsupported model_type: {config.model_type}")
     _normalized_seed(seed)
-    if any(key not in manifest for key in ("development", "test", "folds")):
+    manifest_keys = set(iter(manifest))
+    required_keys = {"development", "test", "folds"}
+    if not required_keys.issubset(manifest_keys):
         raise ValueError("manifest must include development, test, and folds")
 
     development = _validated_row_ids("manifest development", manifest["development"])
@@ -386,7 +388,7 @@ def _validated_evaluation_folds(
     folds_value = manifest["folds"]
     if not isinstance(folds_value, (list, tuple)) or not folds_value:
         raise ValueError("manifest folds must be a nonempty list")
-    if "n_splits" in manifest:
+    if "n_splits" in manifest_keys:
         n_splits = manifest["n_splits"]
         if (
             isinstance(n_splits, bool)

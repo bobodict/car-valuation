@@ -117,11 +117,20 @@ def tiny_candidate_configs():
     )
 
 
-class TestReadGuard(dict):
+class SealedTestManifest(Mapping):
+    def __init__(self, values):
+        self._values = values
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
     def __getitem__(self, key):
         if key == "test":
-            raise AssertionError("evaluate_candidate read the outer test IDs")
-        return super().__getitem__(key)
+            raise AssertionError("outer test value accessed")
+        return self._values[key]
 
 
 class ModelCompetitionTests(unittest.TestCase):
@@ -450,7 +459,6 @@ class ModelCompetitionTests(unittest.TestCase):
         )
         self.assertIsNotNone(evaluate_candidate)
         frame, manifest = make_cv_fixture()
-        manifest = TestReadGuard(manifest)
         config = CandidateConfig(
             "tiny-extra-trees",
             "extra_trees",
@@ -535,6 +543,36 @@ class ModelCompetitionTests(unittest.TestCase):
         self.assertEqual(len(first), 11)
         self.assertEqual(len({item.name for item in first}), 11)
         self.assertTrue(all(item.complexity >= 0 for item in first))
+
+    def test_evaluate_candidate_does_not_read_outer_test_value(self):
+        frame, values = make_cv_fixture()
+        manifest = SealedTestManifest(values)
+        config = tiny_candidate_configs()[1]
+
+        class NoOpAdapter:
+            def fit(self, train_frame, validation_frame=None):
+                self.prediction = float(train_frame["price"].mean())
+                return self
+
+            def predict(self, prediction_frame):
+                return np.full(len(prediction_frame), self.prediction)
+
+        try:
+            with patch.object(
+                model_competition,
+                "_create_adapter",
+                return_value=NoOpAdapter(),
+            ):
+                result = model_competition.evaluate_candidate(
+                    frame,
+                    manifest,
+                    config,
+                    seed=42,
+                )
+        except AssertionError as exc:
+            self.fail(str(exc))
+
+        self.assertEqual(len(result["fold_metrics"]), 5)
 
     def test_manifest_contract_requires_outer_test_membership(self):
         evaluate_candidate = getattr(
