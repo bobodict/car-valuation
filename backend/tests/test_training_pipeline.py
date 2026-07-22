@@ -2119,6 +2119,91 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertFalse((formal / "first-marker.bin").exists())
             self.assertEqual(list(root.glob(".models.publish.lock-*")), [])
 
+    def test_terminal_lock_token_mismatch_is_preserved_and_blocks_acquisition(self):
+        lock_path = self.require_function("_publication_lock_path")
+        recover_lock = self.require_function("_recover_terminal_publication_lock")
+        acquire_lock = self.require_function("_acquire_publication_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for state in ("completed", "failed"):
+                with self.subTest(state=state):
+                    lock_root = root / state
+                    lock_root.mkdir()
+                    formal = lock_root / "models"
+                    lock_dir = lock_path(formal, "a" * 32)
+                    lock_dir.mkdir()
+                    metadata_bytes = json.dumps(
+                        {
+                            "state": state,
+                            "token": "b" * 32,
+                        },
+                        allow_nan=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    metadata_path = lock_dir / "lock.json"
+                    marker_path = lock_dir / "marker.bin"
+                    metadata_path.write_bytes(metadata_bytes)
+                    marker_path.write_bytes(b"preserve-corrupt-lock")
+
+                    self.assertFalse(recover_lock(lock_dir, formal))
+                    with self.assertRaisesRegex(FileExistsError, "publication|lock"):
+                        acquire_lock(formal)
+
+                    self.assertEqual(metadata_path.read_bytes(), metadata_bytes)
+                    self.assertEqual(marker_path.read_bytes(), b"preserve-corrupt-lock")
+
+    def test_disguised_terminal_lock_path_is_preserved_as_a_conflict(self):
+        recover_lock = self.require_function("_recover_terminal_publication_lock")
+        acquire_lock = self.require_function("_acquire_publication_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            formal = root / "models"
+            token = "a" * 32
+            lock_dir = root / f".models.publish.lock-{token}-extra"
+            lock_dir.mkdir()
+            metadata_path = lock_dir / "lock.json"
+            marker_path = lock_dir / "marker.bin"
+            metadata_bytes = json.dumps(
+                {"state": "completed", "token": token},
+                allow_nan=False,
+                sort_keys=True,
+            ).encode("utf-8")
+            metadata_path.write_bytes(metadata_bytes)
+            marker_path.write_bytes(b"preserve-disguised-lock")
+
+            self.assertFalse(recover_lock(lock_dir, formal))
+            with self.assertRaisesRegex(FileExistsError, "publication|lock"):
+                acquire_lock(formal)
+
+            self.assertEqual(metadata_path.read_bytes(), metadata_bytes)
+            self.assertEqual(marker_path.read_bytes(), b"preserve-disguised-lock")
+
+    def test_malformed_terminal_lock_token_is_preserved_as_a_conflict(self):
+        lock_path = self.require_function("_publication_lock_path")
+        recover_lock = self.require_function("_recover_terminal_publication_lock")
+        acquire_lock = self.require_function("_acquire_publication_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            formal = root / "models"
+            lock_dir = lock_path(formal, "a" * 32)
+            lock_dir.mkdir()
+            metadata_path = lock_dir / "lock.json"
+            marker_path = lock_dir / "marker.bin"
+            metadata_bytes = json.dumps(
+                {"state": "completed", "token": "not-a-lock-token"},
+                allow_nan=False,
+                sort_keys=True,
+            ).encode("utf-8")
+            metadata_path.write_bytes(metadata_bytes)
+            marker_path.write_bytes(b"preserve-malformed-lock")
+
+            self.assertFalse(recover_lock(lock_dir, formal))
+            with self.assertRaisesRegex(FileExistsError, "publication|lock"):
+                acquire_lock(formal)
+
+            self.assertEqual(metadata_path.read_bytes(), metadata_bytes)
+            self.assertEqual(marker_path.read_bytes(), b"preserve-malformed-lock")
+
     def test_failed_terminal_lock_is_recovered_without_masking_original_error(self):
         publication_lock = self.require_function("_publication_lock")
         acquire_lock = self.require_function("_acquire_publication_lock")

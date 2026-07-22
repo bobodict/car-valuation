@@ -2104,16 +2104,20 @@ def _publication_lock_path(formal_dir: Path, token: str) -> Path:
     return formal_dir.with_name(f"{_publication_lock_prefix(formal_dir)}{token}")
 
 
-def _validate_publication_lock_path(lock_dir: Path, formal_dir: Path) -> None:
+def _publication_lock_token_from_path(lock_dir: Path, formal_dir: Path) -> str:
     prefix = _publication_lock_prefix(formal_dir)
-    token = lock_dir.name.removeprefix(prefix)
+    token = lock_dir.name[len(prefix) :] if lock_dir.name.startswith(prefix) else ""
     if (
         lock_dir.parent != formal_dir.parent
-        or not lock_dir.name.startswith(prefix)
         or not _is_publication_lock_token(token)
         or lock_dir != _publication_lock_path(formal_dir, token)
     ):
         raise ValueError("refusing publication lock operation outside exact lock path")
+    return token
+
+
+def _validate_publication_lock_path(lock_dir: Path, formal_dir: Path) -> None:
+    _publication_lock_token_from_path(lock_dir, formal_dir)
 
 
 def _publication_mutex_name(formal_dir: Path) -> str:
@@ -2275,7 +2279,10 @@ def _mark_publication_lock(
 
 
 def _recover_terminal_publication_lock(lock_dir: Path, formal_dir: Path) -> bool:
-    _validate_publication_lock_path(lock_dir, formal_dir)
+    try:
+        directory_token = _publication_lock_token_from_path(lock_dir, formal_dir)
+    except ValueError:
+        return False
     lexical = lock_dir.absolute()
     try:
         resolved = lock_dir.resolve(strict=True)
@@ -2293,6 +2300,7 @@ def _recover_terminal_publication_lock(lock_dir: Path, formal_dir: Path) -> bool
     if (
         metadata.get("state") not in {"completed", "failed"}
         or not _is_publication_lock_token(metadata.get("token"))
+        or metadata["token"] != directory_token
     ):
         return False
     shutil.rmtree(lock_dir)
