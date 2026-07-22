@@ -4,6 +4,12 @@ from numbers import Integral, Real
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import (
+    is_bool_dtype,
+    is_complex_dtype,
+    is_datetime64_any_dtype,
+    is_timedelta64_dtype,
+)
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 
@@ -27,11 +33,30 @@ def _validated_prices(frame: pd.DataFrame) -> np.ndarray:
         raise ValueError("frame must contain a price column")
 
     source = frame["price"]
-    invalid_type = source.map(
+    invalid_dtype = (
+        is_bool_dtype(source.dtype)
+        or is_complex_dtype(source.dtype)
+        or is_datetime64_any_dtype(source.dtype)
+        or is_timedelta64_dtype(source.dtype)
+    )
+    invalid_value_type = source.map(
         lambda value: isinstance(
-            value, (bool, np.bool_, complex, np.complexfloating)
+            value,
+            (
+                bool,
+                np.bool_,
+                complex,
+                np.complexfloating,
+                np.datetime64,
+                np.timedelta64,
+                pd.Timestamp,
+                pd.Timedelta,
+            ),
         )
     )
+    if invalid_dtype or invalid_value_type.any():
+        raise ValueError("price must contain only finite positive numeric values")
+
     numeric = pd.to_numeric(source, errors="coerce")
     try:
         prices = numeric.to_numpy(dtype=float, na_value=np.nan)
@@ -40,7 +65,7 @@ def _validated_prices(frame: pd.DataFrame) -> np.ndarray:
             "price must contain only finite positive numeric values"
         ) from None
 
-    if invalid_type.any() or not np.isfinite(prices).all() or (prices <= 0).any():
+    if not np.isfinite(prices).all() or (prices <= 0).any():
         raise ValueError("price must contain only finite positive numeric values")
     return prices
 

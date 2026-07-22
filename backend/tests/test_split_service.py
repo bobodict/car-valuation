@@ -115,6 +115,7 @@ class SplitServiceTests(unittest.TestCase):
             "zero": 0,
             "negative": -1,
             "boolean": True,
+            "complex": 1 + 2j,
         }
 
         for label, invalid_price in cases.items():
@@ -128,6 +129,51 @@ class SplitServiceTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, "price"):
                     build_split_manifest(frame)
+
+    def test_datetime_price_dtype_is_rejected_before_numeric_coercion(self):
+        frame = pd.DataFrame(
+            {
+                "price": pd.Series(
+                    pd.date_range("2020-01-01", periods=200, freq="D"),
+                    dtype="datetime64[ns]",
+                )
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "price"):
+            build_split_manifest(frame)
+
+    def test_timedelta_price_dtype_is_rejected_before_numeric_coercion(self):
+        frame = pd.DataFrame(
+            {
+                "price": pd.Series(
+                    pd.to_timedelta(np.arange(1, 201), unit="D"),
+                    dtype="timedelta64[ns]",
+                )
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "price"):
+            build_split_manifest(frame)
+
+    def test_real_numpy_and_pandas_numeric_price_dtypes_are_accepted(self):
+        cases = {
+            "numpy int64": np.arange(1, 201, dtype=np.int64) * 1_000,
+            "numpy float64": np.arange(1, 201, dtype=np.float64) * 1_000,
+            "pandas Int64": pd.Series(range(1, 201), dtype="Int64") * 1_000,
+            "pandas Float64": pd.Series(range(1, 201), dtype="Float64") * 1_000,
+        }
+
+        for label, prices in cases.items():
+            with self.subTest(label=label):
+                frame = pd.DataFrame({"price": prices})
+
+                manifest = build_split_manifest(frame)
+
+                self.assertEqual(
+                    set(manifest["development"]) | set(manifest["test"]),
+                    set(frame.index),
+                )
 
     def test_too_small_frame_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "enough rows"):
