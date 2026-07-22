@@ -290,7 +290,102 @@
             </div>
           </div>
 
-          <!-- 页面二：数据看板 -->
+          <!-- 页面二：大模型助手 -->
+          <div class="page" :class="{ active: currentPage === 'page-assistant' }">
+            <div class="assistant-layout">
+              <div class="card assistant-chat-card">
+                <div class="card-header">
+                  <div class="card-title">
+                    对话工作区
+                    <span class="card-tag">工具增强</span>
+                  </div>
+                  <div class="card-meta">
+                    大模型只负责理解与解释，价格由后端估值工具计算。
+                  </div>
+                </div>
+
+                <div class="assistant-messages" aria-live="polite">
+                  <div v-if="assistantMessages.length === 0" class="assistant-empty">
+                    还没有对话。可以描述车辆信息，或询问估值、车况和排放字段。
+                  </div>
+                  <div
+                    v-for="(message, index) in assistantMessages"
+                    :key="`${message.role}-${index}`"
+                    class="assistant-message"
+                    :class="`assistant-message-${message.role}`"
+                  >
+                    <div class="assistant-message-role">
+                      {{ message.role === 'user' ? '你' : '助手' }}
+                    </div>
+                    <div class="assistant-message-content">{{ message.content }}</div>
+                  </div>
+                  <div v-if="assistantLoading" class="assistant-message assistant-message-assistant">
+                    <div class="assistant-message-role">助手</div>
+                    <div class="assistant-message-content">正在检索资料并调用工具...</div>
+                  </div>
+                </div>
+
+                <form class="assistant-form" @submit.prevent="submitAssistant">
+                  <textarea
+                    v-model="assistantInput"
+                    class="assistant-input"
+                    rows="4"
+                    maxlength="4000"
+                    placeholder="例如：2018 年广州帕萨特，6.5 万公里，自动挡，大概值多少？"
+                    :disabled="assistantLoading"
+                  ></textarea>
+                  <div class="assistant-form-footer">
+                    <span class="card-meta">{{ assistantInput.length }}/4000</span>
+                    <button type="submit" class="primary-btn" :disabled="assistantLoading || !assistantInput.trim()">
+                      {{ assistantLoading ? '处理中...' : '发送' }}
+                      <span>→</span>
+                    </button>
+                  </div>
+                </form>
+
+                <div v-if="assistantError" class="error-banner" role="alert">
+                  {{ assistantError }}
+                </div>
+              </div>
+
+              <div class="card assistant-side-card">
+                <div class="card-header">
+                  <div class="card-title">工具结果</div>
+                  <span class="badge-soft" :class="assistantStatus === 'configured' ? 'badge-soft-success' : 'badge-soft-warning'">
+                    {{ assistantStatus === 'configured' ? '模型已配置' : '模型未配置' }}
+                  </span>
+                </div>
+
+                <div v-if="assistantEstimate" class="assistant-estimate">
+                  <div class="metric-label">估值结果</div>
+                  <div class="assistant-estimate-price">
+                    {{ Number(assistantEstimate.price).toFixed(2) }}
+                    <span>万元</span>
+                  </div>
+                  <div class="card-meta">
+                    参考区间：{{ Number(assistantEstimate.range.low).toFixed(2) }} - {{ Number(assistantEstimate.range.high).toFixed(2) }} 万
+                  </div>
+                  <div class="assistant-estimate-note">{{ assistantEstimate.comment }}</div>
+                </div>
+                <div v-else class="assistant-empty assistant-side-empty">
+                  完成一次带估值工具调用的对话后，结果会显示在这里。
+                </div>
+
+                <div class="assistant-citations">
+                  <div class="card-title">检索来源</div>
+                  <div v-if="assistantCitations.length === 0" class="card-meta">
+                    当前对话还没有来源。
+                  </div>
+                  <div v-for="citation in assistantCitations" :key="citation.source_id" class="citation-item">
+                    <span class="citation-id">{{ citation.source_id }}</span>
+                    <span>{{ citation.title }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 页面三：数据看板 -->
           <div class="page" :class="{ active: currentPage === 'page-dashboard' }">
             <div class="card">
               <div class="card-header">
@@ -493,6 +588,13 @@ export default {
           tag: '核心'
         },
         {
+          id: 'page-assistant',
+          icon: 'AI',
+          label: '大模型助手',
+          subLabel: '知识检索 · 工具估值',
+          tag: '实验'
+        },
+        {
           id: 'page-dashboard',
           icon: '📊',
           label: '数据看板',
@@ -512,6 +614,11 @@ export default {
           title: '车辆估值',
           chip: 'FEATURE · CORE',
           desc: '输入车辆信息后，系统将调用价格预测模型，给出当前市场估值区间。'
+        },
+        'page-assistant': {
+          title: '大模型助手',
+          chip: 'RAG · TOOL USE',
+          desc: '检索项目知识库，并在需要时调用结构化估值工具生成带来源的说明。'
         },
         'page-dashboard': {
           title: '数据看板',
@@ -561,6 +668,13 @@ export default {
         metrics: ''
       },
       historyDetail: null,
+      assistantInput: '',
+      assistantMessages: [],
+      assistantLoading: false,
+      assistantError: '',
+      assistantStatus: 'disabled',
+      assistantCitations: [],
+      assistantEstimate: null,
       chartPriceDist: null,
       chartTrend: null,
       chartsInit: false
@@ -740,6 +854,36 @@ async submitValuation() {
     this.loading.prediction = false;
   }
 },
+
+    async submitAssistant() {
+      const message = this.assistantInput.trim();
+      if (!message || this.assistantLoading) return;
+
+      this.assistantMessages.push({ role: 'user', content: message });
+      this.assistantInput = '';
+      this.assistantLoading = true;
+      this.assistantError = '';
+      try {
+        const resp = await fetch(`${API_BASE}/api/assistant`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message })
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          throw new Error(data.detail || `助手请求失败：${resp.status}`);
+        }
+        this.assistantMessages.push({ role: 'assistant', content: data.answer });
+        this.assistantStatus = data.llm_status || 'configured';
+        this.assistantCitations = data.citations || [];
+        this.assistantEstimate = data.estimate || null;
+      } catch (err) {
+        console.error(err);
+        this.assistantError = err.message || '助手请求失败，请检查模型服务配置。';
+      } finally {
+        this.assistantLoading = false;
+      }
+    },
 
     resetForm() {
       this.form = {
@@ -1732,6 +1876,160 @@ body {
   font-weight: 500;
 }
 
+.assistant-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+  gap: 12px;
+}
+
+.assistant-chat-card,
+.assistant-side-card {
+  min-height: 520px;
+}
+
+.assistant-messages {
+  min-height: 260px;
+  max-height: 420px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+}
+
+.assistant-empty {
+  padding: 18px;
+  border: 1px dashed rgba(96, 165, 250, 0.4);
+  border-radius: 10px;
+  color: var(--text-subtle);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.assistant-message {
+  max-width: 88%;
+  padding: 9px 11px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.assistant-message-user {
+  align-self: flex-end;
+  color: #dbeafe;
+  background: rgba(30, 64, 175, 0.48);
+  border: 1px solid rgba(96, 165, 250, 0.5);
+}
+
+.assistant-message-assistant {
+  align-self: flex-start;
+  color: #e5e7eb;
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid rgba(71, 85, 105, 0.85);
+}
+
+.assistant-message-role {
+  margin-bottom: 3px;
+  color: var(--text-subtle);
+  font-size: 10px;
+}
+
+.assistant-message-content {
+  white-space: pre-wrap;
+}
+
+.assistant-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.assistant-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 88px;
+  border-radius: 10px;
+  border: 1px solid rgba(55, 65, 81, 0.9);
+  background: #000000;
+  padding: 9px 11px;
+  color: #e5e7eb;
+  font: inherit;
+  outline: none;
+}
+
+.assistant-input:focus {
+  border-color: rgba(129, 140, 248, 0.95);
+  box-shadow: 0 0 0 1px rgba(79, 70, 229, 0.85);
+}
+
+.assistant-form-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.assistant-side-card {
+  gap: 14px;
+}
+
+.assistant-side-empty {
+  margin-top: 4px;
+}
+
+.assistant-estimate {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  background: rgba(30, 64, 175, 0.14);
+}
+
+.assistant-estimate-price {
+  margin: 6px 0;
+  font-size: 26px;
+  font-weight: 600;
+}
+
+.assistant-estimate-price span {
+  font-size: 12px;
+  color: var(--text-subtle);
+}
+
+.assistant-estimate-note {
+  margin-top: 10px;
+  color: var(--text-subtle);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.assistant-citations {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(75, 85, 99, 0.9);
+}
+
+.citation-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.78);
+  color: #d1d5db;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.citation-id {
+  color: #93c5fd;
+  font-family: monospace;
+  font-size: 10px;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1820,7 +2118,8 @@ tbody tr:hover {
   }
 
   .card-grid,
-  .chart-row {
+  .chart-row,
+  .assistant-layout {
     grid-template-columns: minmax(0, 1fr);
   }
 }

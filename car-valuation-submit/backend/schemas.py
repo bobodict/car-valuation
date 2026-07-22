@@ -58,6 +58,23 @@ class MetricsResponse(BaseModel):
     test_metrics: TestMetrics
 
 
+class AssistantRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("message")
+    @classmethod
+    def reject_blank_message(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("message must not be blank")
+        return value
+
+
+class Citation(BaseModel):
+    source_id: str
+    title: str
+
+
 class PredictResponse(BaseModel):
     price: float
     range: PriceRange
@@ -65,6 +82,13 @@ class PredictResponse(BaseModel):
     model_status: Literal["experimental"]
     metrics: TestMetrics
     comment: str
+
+
+class AssistantResponse(BaseModel):
+    answer: str
+    citations: list[Citation] = Field(default_factory=list)
+    estimate: PredictResponse | None = None
+    llm_status: Literal["configured"]
 
 
 class HistoryOut(BaseModel):

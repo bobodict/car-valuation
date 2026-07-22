@@ -39,6 +39,10 @@ def _build_database_url() -> str:
 class Settings:
     database_url: str
     allowed_origins: tuple[str, ...]
+    llm_base_url: str
+    llm_api_key: str
+    llm_model: str
+    llm_timeout_seconds: float
     models_dir: Path = BACKEND_DIR / "models"
 
     @property
@@ -57,6 +61,10 @@ class Settings:
     def metrics_path(self) -> Path:
         return self.models_dir / "metrics.json"
 
+    @property
+    def knowledge_path(self) -> Path:
+        return BACKEND_DIR / "data" / "knowledge_base.json"
+
 
 def _allowed_origins() -> tuple[str, ...]:
     raw = os.getenv(
@@ -69,4 +77,8 @@ def _allowed_origins() -> tuple[str, ...]:
 settings = Settings(
     database_url=_build_database_url(),
     allowed_origins=_allowed_origins(),
+    llm_base_url=os.getenv("LLM_BASE_URL", "").rstrip("/"),
+    llm_api_key=os.getenv("LLM_API_KEY", ""),
+    llm_model=os.getenv("LLM_MODEL", ""),
+    llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "45")),
 )

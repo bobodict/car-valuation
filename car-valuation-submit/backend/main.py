@@ -11,12 +11,16 @@ from config import settings
 from database import Base, engine, get_db
 from models import History
 from schemas import (
+    AssistantRequest,
+    AssistantResponse,
     HistoryOut,
     HistoryQuery,
     MetricsResponse,
     PredictRequest,
     PredictResponse,
 )
+from services.assistant_service import answer_user_message
+from services.llm_client import LLMClientError, LLMNotConfiguredError
 from services.metrics_service import load_metrics
 from services.model_service import ModelServiceError, call_model_api
 
@@ -84,6 +88,16 @@ def get_history(
 @app.get("/api/metrics", response_model=MetricsResponse)
 def get_metrics():
     return load_metrics()
+
+
+@app.post("/api/assistant", response_model=AssistantResponse)
+def assistant(body: AssistantRequest):
+    try:
+        return answer_user_message(body.message)
+    except LLMNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LLMClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/")
