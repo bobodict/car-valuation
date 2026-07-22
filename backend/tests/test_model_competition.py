@@ -4,10 +4,13 @@ import unittest
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import joblib
 import numpy as np
 import pandas as pd
+import torch
 
 from services import model_competition
 from services.feature_engineering import CATEGORICAL_FEATURES, MODEL_FEATURES
@@ -495,7 +498,13 @@ class ModelCompetitionTests(unittest.TestCase):
             create=True,
             side_effect=lambda candidate_config, seed: RecordingAdapter(),
         ):
-            result = evaluate_candidate(frame, manifest, config, seed=42)
+            result = evaluate_candidate(
+                frame,
+                manifest,
+                config,
+                collection_year=2026,
+                seed=42,
+            )
 
         self.assertEqual(len(result["fold_metrics"]), 5)
         for observed, expected in zip(
@@ -567,6 +576,7 @@ class ModelCompetitionTests(unittest.TestCase):
                     frame,
                     manifest,
                     config,
+                    collection_year=2026,
                     seed=42,
                 )
         except AssertionError as exc:
@@ -603,7 +613,13 @@ class ModelCompetitionTests(unittest.TestCase):
                 ValueError,
                 "manifest must include development, test, and folds",
             ):
-                evaluate_candidate(frame, manifest, config, seed=42)
+                evaluate_candidate(
+                    frame,
+                    manifest,
+                    config,
+                    collection_year=2026,
+                    seed=42,
+                )
 
     def test_evaluate_candidate_rejects_seed_outside_uint32_range(self):
         frame, manifest = make_cv_fixture()
@@ -624,6 +640,7 @@ class ModelCompetitionTests(unittest.TestCase):
                             frame,
                             manifest,
                             config,
+                            collection_year=2026,
                             seed=invalid_seed,
                         )
 
@@ -647,7 +664,100 @@ class ModelCompetitionTests(unittest.TestCase):
                     frame,
                     manifest,
                     config,
+                    collection_year=2026,
                     seed=42,
+                )
+
+    def test_evaluate_candidate_requires_valid_explicit_collection_year(self):
+        frame, manifest = make_cv_fixture()
+        config = tiny_candidate_configs()[1]
+
+        with self.assertRaises(TypeError):
+            model_competition.evaluate_candidate(frame, manifest, config)
+
+        for invalid_year in (True, 2026.0, 1979, 2101):
+            with self.subTest(collection_year=invalid_year):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "collection_year must be an integer between 1980 and 2100",
+                ):
+                    model_competition.evaluate_candidate(
+                        frame,
+                        manifest,
+                        config,
+                        collection_year=invalid_year,
+                    )
+
+    def test_explicit_collection_year_controls_feature_enrichment(self):
+        frame, manifest = make_cv_fixture()
+        config = tiny_candidate_configs()[1]
+        observed_ages = []
+
+        class RecordingAdapter:
+            def fit(self, train_frame, validation_frame=None):
+                observed_ages.append(
+                    (
+                        train_frame["car_age"].tolist(),
+                        validation_frame["car_age"].tolist(),
+                    )
+                )
+                self.prediction = float(train_frame["price"].mean())
+                return self
+
+            def predict(self, prediction_frame):
+                return np.full(len(prediction_frame), self.prediction)
+
+        class UnexpectedSystemDate:
+            @classmethod
+            def today(cls):
+                raise AssertionError("system date accessed")
+
+        with (
+            patch.object(
+                model_competition,
+                "_create_adapter",
+                return_value=RecordingAdapter(),
+            ),
+            patch.object(
+                model_competition,
+                "date",
+                UnexpectedSystemDate,
+                create=True,
+            ),
+        ):
+            first = model_competition.evaluate_candidate(
+                frame,
+                manifest,
+                config,
+                collection_year=2026,
+            )
+            first_ages = list(observed_ages)
+            observed_ages.clear()
+            second = model_competition.evaluate_candidate(
+                frame,
+                manifest,
+                config,
+                collection_year=2026,
+            )
+            second_ages = list(observed_ages)
+            observed_ages.clear()
+            later = model_competition.evaluate_candidate(
+                frame,
+                manifest,
+                config,
+                collection_year=2027,
+            )
+            later_ages = list(observed_ages)
+
+        self.assertEqual(first["collection_year"], 2026)
+        self.assertEqual(second["collection_year"], 2026)
+        self.assertEqual(later["collection_year"], 2027)
+        self.assertEqual(first_ages, second_ages)
+        for earlier_fold, later_fold in zip(first_ages, later_ages):
+            for earlier_rows, later_rows in zip(earlier_fold, later_fold):
+                self.assertEqual(
+                    [age + 1 for age in earlier_rows],
+                    later_rows,
                 )
 
     def test_real_candidate_adapters_fit_predict_and_save_with_tiny_budgets(self):
@@ -686,6 +796,87 @@ class ModelCompetitionTests(unittest.TestCase):
                     for relative_path in metadata["artifacts"].values():
                         self.assertTrue((artifact_dir / relative_path).is_file())
                     json.dumps(metadata, allow_nan=False)
+
+                    prediction_frame = validation_frame.loc[:, MODEL_FEATURES]
+                    if config.model_type == "catboost":
+                        loaded_model = model_competition.CatBoostRegressor()
+                        loaded_model.load_model(
+                            artifact_dir / metadata["artifacts"]["model"]
+                        )
+                        reloaded_predictions = model_competition._inr_predictions(
+                            loaded_model.predict(
+                                model_competition._feature_frame(prediction_frame)
+                            )
+                        )
+                    elif config.model_type == "extra_trees":
+                        bundle = joblib.load(
+                            artifact_dir / metadata["artifacts"]["bundle"]
+                        )
+                        transformed = bundle["preprocessor"].transform(
+                            model_competition._feature_frame(prediction_frame)
+                        )
+                        reloaded_predictions = model_competition._inr_predictions(
+                            bundle["model"].predict(transformed)
+                        )
+                    else:
+                        preprocessor = joblib.load(
+                            artifact_dir / metadata["artifacts"]["preprocessor"]
+                        )
+                        checkpoint = torch.load(
+                            artifact_dir / metadata["artifacts"]["model"],
+                            map_location="cpu",
+                        )
+                        loaded_model = model_competition.MLPRegressor(
+                            checkpoint["input_dim"],
+                            tuple(checkpoint["hidden_dims"]),
+                            checkpoint["dropout"],
+                        )
+                        loaded_model.load_state_dict(checkpoint["model_state"])
+                        loaded_model.eval()
+                        self.assertTrue(
+                            all(
+                                parameter.device.type == "cpu"
+                                for parameter in loaded_model.parameters()
+                            )
+                        )
+                        transformed = preprocessor.transform(
+                            model_competition._feature_frame(prediction_frame)
+                        )
+                        with torch.no_grad():
+                            transformed_predictions = loaded_model(
+                                model_competition._tensor(transformed)
+                            ).numpy().reshape(-1)
+                        reloaded_predictions = model_competition._inr_predictions(
+                            transformed_predictions
+                        )
+
+                    np.testing.assert_allclose(
+                        reloaded_predictions,
+                        predictions,
+                        rtol=0,
+                        atol=0,
+                    )
+
+    def test_candidate_adapters_reject_predict_and_save_before_fit(self):
+        frame, _ = make_cv_fixture()
+        prediction_frame = model_competition._model_frame(frame.iloc[:2], 2026)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for config in tiny_candidate_configs():
+                with self.subTest(model_type=config.model_type):
+                    adapter = model_competition._create_adapter(config, seed=42)
+                    message_prefix = f"{config.model_type} adapter must be fitted"
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        f"{message_prefix} before prediction",
+                    ):
+                        adapter.predict(prediction_frame)
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        f"{message_prefix} before saving",
+                    ):
+                        adapter.save(root / config.model_type)
 
     def test_fold_preprocessors_fit_numeric_and_categories_on_train_only(self):
         create_adapter = getattr(model_competition, "_create_adapter", None)
@@ -771,6 +962,300 @@ class ModelCompetitionTests(unittest.TestCase):
         )
         self.assertEqual(first.best_epoch, second.best_epoch)
 
+    def test_fit_mlp_network_validates_feature_and_target_arrays(self):
+        fit_network = model_competition.fit_mlp_network
+        valid_features = np.array([[0.0, 1.0], [1.0, 2.0]])
+        valid_targets = np.array([0.0, 1.0])
+        cases = (
+            (
+                "empty_train_features",
+                np.empty((0, 2)),
+                np.array([]),
+                valid_features,
+                valid_targets,
+                "train_features must be a nonempty finite 2-D numeric array",
+            ),
+            (
+                "train_features",
+                np.array([0.0, 1.0]),
+                valid_targets,
+                valid_features,
+                valid_targets,
+                "train_features must be a nonempty finite 2-D numeric array",
+            ),
+            (
+                "nonnumeric_validation_features",
+                valid_features,
+                valid_targets,
+                np.array([["zero", "one"], ["one", "two"]]),
+                valid_targets,
+                "validation_features must be a nonempty finite 2-D numeric array",
+            ),
+            (
+                "validation_features",
+                valid_features,
+                valid_targets,
+                np.array([[0.0, np.nan], [1.0, 2.0]]),
+                valid_targets,
+                "validation_features must be a nonempty finite 2-D numeric array",
+            ),
+            (
+                "empty_train_targets",
+                valid_features,
+                np.array([]),
+                valid_features,
+                valid_targets,
+                "train_targets must be a nonempty finite 1-D numeric array",
+            ),
+            (
+                "nonnumeric_validation_targets",
+                valid_features,
+                valid_targets,
+                valid_features,
+                np.array(["zero", "one"]),
+                "validation_targets must be a nonempty finite 1-D numeric array",
+            ),
+            (
+                "train_targets",
+                valid_features,
+                np.array([[0.0], [1.0]]),
+                valid_features,
+                valid_targets,
+                "train_targets must be a nonempty finite 1-D numeric array",
+            ),
+            (
+                "validation_targets",
+                valid_features,
+                valid_targets,
+                valid_features,
+                np.array([0.0, np.inf]),
+                "validation_targets must be a nonempty finite 1-D numeric array",
+            ),
+        )
+
+        for (
+            name,
+            train_features,
+            train_targets,
+            validation_features,
+            validation_targets,
+            message,
+        ) in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    fit_network(
+                        train_features,
+                        train_targets,
+                        validation_features,
+                        validation_targets,
+                        hidden_dims=(2,),
+                        max_epochs=1,
+                        patience=1,
+                    )
+
+    def test_fit_mlp_network_rejects_mismatched_rows_and_feature_widths(self):
+        fit_network = model_competition.fit_mlp_network
+        valid_features = np.array([[0.0, 1.0], [1.0, 2.0]])
+        valid_targets = np.array([0.0, 1.0])
+
+        cases = (
+            (
+                valid_features,
+                np.array([0.0]),
+                valid_features,
+                valid_targets,
+                "train feature and target row counts must match",
+            ),
+            (
+                valid_features,
+                valid_targets,
+                valid_features,
+                np.array([0.0]),
+                "validation feature and target row counts must match",
+            ),
+            (
+                valid_features,
+                valid_targets,
+                np.ones((2, 3)),
+                valid_targets,
+                "train and validation feature widths must match",
+            ),
+        )
+
+        for case in cases:
+            with self.subTest(message=case[-1]):
+                with self.assertRaisesRegex(ValueError, case[-1]):
+                    fit_network(
+                        *case[:-1],
+                        hidden_dims=(2,),
+                        max_epochs=1,
+                        patience=1,
+                    )
+
+    def test_fit_mlp_network_validates_architecture_and_optimizer_params(self):
+        fit_network = model_competition.fit_mlp_network
+        features = np.array([[0.0, 1.0], [1.0, 2.0]])
+        targets = np.array([0.0, 1.0])
+        cases = (
+            (
+                {"hidden_dims": ()},
+                "mlp hidden_dims must be a nonempty tuple or list of positive integers",
+            ),
+            (
+                {"hidden_dims": [2, True]},
+                "mlp hidden_dims must be a nonempty tuple or list of positive integers",
+            ),
+            (
+                {"hidden_dims": (0,)},
+                "mlp hidden_dims must be a nonempty tuple or list of positive integers",
+            ),
+            ({"dropout": True}, "mlp dropout must be finite and between 0 and 1"),
+            ({"dropout": np.nan}, "mlp dropout must be finite and between 0 and 1"),
+            ({"dropout": 1.0}, "mlp dropout must be finite and between 0 and 1"),
+            (
+                {"learning_rate": True},
+                "mlp learning_rate must be finite and positive",
+            ),
+            (
+                {"learning_rate": np.inf},
+                "mlp learning_rate must be finite and positive",
+            ),
+            (
+                {"learning_rate": 0.0},
+                "mlp learning_rate must be finite and positive",
+            ),
+        )
+
+        for params, message in cases:
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(ValueError, message):
+                    fit_network(
+                        features,
+                        targets,
+                        features,
+                        targets,
+                        max_epochs=1,
+                        patience=1,
+                        **params,
+                    )
+
+    def test_fit_mlp_network_rejects_nonfinite_validation_loss(self):
+        features = np.array([[0.0, 1.0], [1.0, 2.0]])
+        targets = np.array([0.0, 1.0])
+
+        class NonFiniteValidationLoss(torch.nn.Module):
+            def forward(self, predictions, actual):
+                if torch.is_grad_enabled():
+                    return torch.mean((predictions - actual) ** 2)
+                return torch.tensor(float("inf"))
+
+        with patch.object(
+            model_competition.nn,
+            "MSELoss",
+            return_value=NonFiniteValidationLoss(),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "mlp validation loss must be finite",
+            ):
+                model_competition.fit_mlp_network(
+                    features,
+                    targets,
+                    features,
+                    targets,
+                    hidden_dims=(2,),
+                    max_epochs=1,
+                    patience=1,
+                )
+
+    def test_fit_mlp_network_preserves_numpy_and_torch_rng_sequences(self):
+        features = np.array([[0.0, 1.0], [1.0, 2.0]])
+        targets = np.array([0.0, 1.0])
+        original_numpy_state = np.random.get_state()
+        original_torch_state = torch.random.get_rng_state()
+
+        try:
+            np.random.seed(12345)
+            torch.manual_seed(54321)
+            expected_numpy = np.random.random(6)
+            expected_torch = torch.rand(6)
+
+            np.random.seed(12345)
+            torch.manual_seed(54321)
+            model_competition.fit_mlp_network(
+                features,
+                targets,
+                features,
+                targets,
+                hidden_dims=[3],
+                dropout=0.25,
+                max_epochs=2,
+                patience=2,
+                seed=42,
+            )
+            observed_numpy = np.random.random(6)
+            observed_torch = torch.rand(6)
+        finally:
+            np.random.set_state(original_numpy_state)
+            torch.random.set_rng_state(original_torch_state)
+
+        np.testing.assert_array_equal(observed_numpy, expected_numpy)
+        torch.testing.assert_close(observed_torch, expected_torch, rtol=0, atol=0)
+
+    def test_fit_mlp_network_is_deterministic_despite_caller_rng_history(self):
+        features = np.array([[0.0, 1.0], [1.0, 2.0]])
+        targets = np.array([0.0, 1.0])
+        original_torch_state = torch.random.get_rng_state()
+
+        try:
+            torch.manual_seed(111)
+            torch.rand(7)
+            first, first_loss, first_epoch = model_competition.fit_mlp_network(
+                features,
+                targets,
+                features,
+                targets,
+                hidden_dims=(3,),
+                dropout=0.25,
+                max_epochs=3,
+                patience=2,
+                seed=42,
+            )
+            torch.manual_seed(999)
+            torch.rand(11)
+            second, second_loss, second_epoch = model_competition.fit_mlp_network(
+                features,
+                targets,
+                features,
+                targets,
+                hidden_dims=(3,),
+                dropout=0.25,
+                max_epochs=3,
+                patience=2,
+                seed=42,
+            )
+        finally:
+            torch.random.set_rng_state(original_torch_state)
+
+        self.assertEqual(first_loss, second_loss)
+        self.assertEqual(first_epoch, second_epoch)
+        self.assertGreaterEqual(first_epoch, 0)
+        self.assertTrue(np.isfinite(first_loss))
+        with torch.no_grad():
+            restored_loss = torch.mean(
+                (
+                    first(model_competition._tensor(features)).reshape(-1)
+                    - model_competition._tensor(targets)
+                )
+                ** 2
+            ).item()
+        self.assertEqual(restored_loss, first_loss)
+        for first_value, second_value in zip(
+            first.state_dict().values(),
+            second.state_dict().values(),
+        ):
+            torch.testing.assert_close(first_value, second_value, rtol=0, atol=0)
+
     def test_adapter_factory_rejects_invalid_family_params_and_budgets(self):
         create_adapter = getattr(model_competition, "_create_adapter", None)
         self.assertIsNotNone(create_adapter)
@@ -826,6 +1311,159 @@ class ModelCompetitionTests(unittest.TestCase):
             with self.subTest(name=config.name):
                 with self.assertRaisesRegex(ValueError, message):
                     create_adapter(config, seed=42)
+
+    def test_catboost_adapter_validates_params_at_construction(self):
+        base = {
+            "depth": 2,
+            "learning_rate": 0.1,
+            "l2_leaf_reg": 3.0,
+            "loss_function": "RMSE",
+            "iterations": 2,
+            "early_stopping_patience": 1,
+        }
+        cases = (
+            ("depth", True, "catboost depth must be between 1 and 16"),
+            ("depth", 1.5, "catboost depth must be between 1 and 16"),
+            ("depth", 0, "catboost depth must be between 1 and 16"),
+            ("depth", 17, "catboost depth must be between 1 and 16"),
+            (
+                "learning_rate",
+                True,
+                "catboost learning_rate must be finite and positive",
+            ),
+            (
+                "learning_rate",
+                0.0,
+                "catboost learning_rate must be finite and positive",
+            ),
+            (
+                "learning_rate",
+                np.inf,
+                "catboost learning_rate must be finite and positive",
+            ),
+            (
+                "l2_leaf_reg",
+                True,
+                "catboost l2_leaf_reg must be finite and nonnegative",
+            ),
+            (
+                "l2_leaf_reg",
+                -1.0,
+                "catboost l2_leaf_reg must be finite and nonnegative",
+            ),
+            (
+                "l2_leaf_reg",
+                np.nan,
+                "catboost l2_leaf_reg must be finite and nonnegative",
+            ),
+            ("loss_function", "MAE", "catboost loss_function must be RMSE"),
+        )
+
+        for name, value, message in cases:
+            with self.subTest(name=name, value=value):
+                params = {**base, name: value}
+                config = SimpleNamespace(params=params)
+                with self.assertRaisesRegex(ValueError, message):
+                    model_competition.CatBoostCandidateAdapter(config, seed=42)
+
+    def test_extra_trees_adapter_validates_params_at_construction(self):
+        base = {
+            "n_estimators": 2,
+            "min_samples_leaf": 1,
+            "max_features": 1.0,
+            "n_jobs": 1,
+        }
+        cases = (
+            (
+                "n_estimators",
+                True,
+                "extra_trees n_estimators must be a positive integer",
+            ),
+            (
+                "n_estimators",
+                1.5,
+                "extra_trees n_estimators must be a positive integer",
+            ),
+            (
+                "n_estimators",
+                0,
+                "extra_trees n_estimators must be a positive integer",
+            ),
+            (
+                "min_samples_leaf",
+                True,
+                "extra_trees min_samples_leaf must be a positive integer",
+            ),
+            (
+                "min_samples_leaf",
+                0.5,
+                "extra_trees min_samples_leaf must be a positive integer",
+            ),
+            (
+                "min_samples_leaf",
+                0,
+                "extra_trees min_samples_leaf must be a positive integer",
+            ),
+            (
+                "max_features",
+                True,
+                "extra_trees max_features must be finite and between 0 and 1",
+            ),
+            (
+                "max_features",
+                np.nan,
+                "extra_trees max_features must be finite and between 0 and 1",
+            ),
+            (
+                "max_features",
+                0.0,
+                "extra_trees max_features must be finite and between 0 and 1",
+            ),
+            (
+                "max_features",
+                1.1,
+                "extra_trees max_features must be finite and between 0 and 1",
+            ),
+            (
+                "n_jobs",
+                True,
+                "extra_trees n_jobs must be a nonzero integer",
+            ),
+            (
+                "n_jobs",
+                0,
+                "extra_trees n_jobs must be a nonzero integer",
+            ),
+            (
+                "n_jobs",
+                1.5,
+                "extra_trees n_jobs must be a nonzero integer",
+            ),
+        )
+
+        for name, value, message in cases:
+            with self.subTest(name=name, value=value):
+                params = {**base, name: value}
+                config = SimpleNamespace(params=params)
+                with self.assertRaisesRegex(ValueError, message):
+                    model_competition.ExtraTreesCandidateAdapter(config, seed=42)
+
+    def test_mlp_adapter_rejects_nonfinite_learning_rate_at_construction(self):
+        config = SimpleNamespace(
+            params={
+                "hidden_dims": (2,),
+                "dropout": 0.0,
+                "learning_rate": np.inf,
+                "max_epochs": 1,
+                "early_stopping_patience": 1,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "mlp learning_rate must be finite and positive",
+        ):
+            model_competition.MLPCandidateAdapter(config, seed=42)
 
     def test_legacy_training_script_reuses_canonical_mlp(self):
         from scripts import train_model

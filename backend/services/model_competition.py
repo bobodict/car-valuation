@@ -2,9 +2,9 @@
 
 import copy
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
 from decimal import Decimal
 from numbers import Integral, Real
 from pathlib import Path
@@ -44,6 +44,7 @@ CATBOOST_MAX_ITERATIONS = 1500
 CATBOOST_EARLY_STOPPING_PATIENCE = 80
 MLP_MAX_EPOCHS = 400
 MLP_EARLY_STOPPING_PATIENCE = 40
+_MLP_TRAINING_LOCK = threading.Lock()
 
 
 class CandidateAdapter(Protocol):
@@ -456,6 +457,18 @@ def _normalized_seed(seed: int) -> int:
     return int(seed)
 
 
+def _normalized_collection_year(collection_year: Any) -> int:
+    if (
+        isinstance(collection_year, bool)
+        or not isinstance(collection_year, Integral)
+        or not 1980 <= int(collection_year) <= 2100
+    ):
+        raise ValueError(
+            "collection_year must be an integer between 1980 and 2100"
+        )
+    return int(collection_year)
+
+
 def _validate_parameter_names(
     family: str,
     params: Mapping[str, Any],
@@ -483,6 +496,38 @@ def _bounded_positive_integer(
             f"{family} {name} must be between 1 and {maximum}"
         )
     return int(value)
+
+
+def _positive_integer(family: str, name: str, value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Integral)
+        or int(value) <= 0
+    ):
+        raise ValueError(f"{family} {name} must be a positive integer")
+    return int(value)
+
+
+def _finite_positive_real(family: str, name: str, value: Any) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not np.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise ValueError(f"{family} {name} must be finite and positive")
+    return float(value)
+
+
+def _finite_nonnegative_real(family: str, name: str, value: Any) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not np.isfinite(float(value))
+        or float(value) < 0
+    ):
+        raise ValueError(f"{family} {name} must be finite and nonnegative")
+    return float(value)
 
 
 def _feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -601,13 +646,150 @@ def _tensor(values: Any) -> torch.Tensor:
     return torch.from_numpy(np.asarray(values, dtype=np.float32))
 
 
+def _validated_mlp_array(
+    name: str,
+    values: Any,
+    *,
+    dimensions: int,
+) -> np.ndarray:
+    message = (
+        f"{name} must be a nonempty finite {dimensions}-D numeric array"
+    )
+    try:
+        array = np.asarray(values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if (
+        array.ndim != dimensions
+        or array.size == 0
+        or any(length == 0 for length in array.shape)
+        or not np.issubdtype(array.dtype, np.number)
+        or np.issubdtype(array.dtype, np.bool_)
+        or np.issubdtype(array.dtype, np.complexfloating)
+        or not np.all(np.isfinite(array))
+    ):
+        raise ValueError(message)
+    with np.errstate(over="ignore", invalid="ignore"):
+        normalized = array.astype(np.float32, copy=False)
+    if not np.all(np.isfinite(normalized)):
+        raise ValueError(message)
+    return normalized
+
+
+def _validated_hidden_dims(hidden_dims: Any) -> tuple[int, ...]:
+    if (
+        not isinstance(hidden_dims, (tuple, list))
+        or not hidden_dims
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or int(value) <= 0
+            for value in hidden_dims
+        )
+    ):
+        raise ValueError(
+            "mlp hidden_dims must be a nonempty tuple or list of positive integers"
+        )
+    return tuple(int(value) for value in hidden_dims)
+
+
+def _validated_dropout(dropout: Any) -> float:
+    if (
+        isinstance(dropout, bool)
+        or not isinstance(dropout, Real)
+        or not np.isfinite(float(dropout))
+        or not 0 <= float(dropout) < 1
+    ):
+        raise ValueError("mlp dropout must be finite and between 0 and 1")
+    return float(dropout)
+
+
+def _validated_learning_rate(learning_rate: Any) -> float:
+    if (
+        isinstance(learning_rate, bool)
+        or not isinstance(learning_rate, Real)
+        or not np.isfinite(float(learning_rate))
+        or float(learning_rate) <= 0
+    ):
+        raise ValueError("mlp learning_rate must be finite and positive")
+    return float(learning_rate)
+
+
+def _fit_mlp_network_with_seed(
+    train_features: np.ndarray,
+    train_targets: np.ndarray,
+    validation_features: np.ndarray,
+    validation_targets: np.ndarray,
+    *,
+    hidden_dims: tuple[int, ...],
+    dropout: float,
+    learning_rate: float,
+    max_epochs: int,
+    patience: int,
+    seed: int,
+) -> tuple[MLPRegressor, float, int]:
+    torch.random.default_generator.manual_seed(seed)
+    model = MLPRegressor(
+        train_features.shape[1],
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    loss_function = nn.MSELoss()
+    train_tensor = _tensor(train_features)
+    train_target_tensor = _tensor(train_targets).reshape(-1, 1)
+    validation_tensor = _tensor(validation_features)
+    validation_target_tensor = _tensor(validation_targets).reshape(-1, 1)
+    best_state = None
+    best_validation_loss = float("inf")
+    best_epoch = -1
+    stale_epochs = 0
+
+    for epoch in range(max_epochs):
+        model.train()
+        optimizer.zero_grad()
+        loss = loss_function(model(train_tensor), train_target_tensor)
+        if not bool(torch.isfinite(loss).item()):
+            raise RuntimeError("mlp training loss must be finite")
+        loss.backward()
+        optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            validation_loss = float(
+                loss_function(
+                    model(validation_tensor),
+                    validation_target_tensor,
+                ).item()
+            )
+        if not np.isfinite(validation_loss):
+            raise RuntimeError("mlp validation loss must be finite")
+        if validation_loss < best_validation_loss:
+            best_validation_loss = validation_loss
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if stale_epochs >= patience:
+            break
+
+    if best_state is None or best_epoch < 0 or not np.isfinite(
+        best_validation_loss
+    ):
+        raise RuntimeError("mlp training did not produce a valid best state")
+    model.load_state_dict(best_state)
+    model.eval()
+    return model, best_validation_loss, best_epoch
+
+
 def fit_mlp_network(
     train_features: np.ndarray,
     train_targets: np.ndarray,
     validation_features: np.ndarray,
     validation_targets: np.ndarray,
     *,
-    hidden_dims: tuple[int, ...] = (128, 64),
+    hidden_dims: tuple[int, ...] | list[int] = (128, 64),
     dropout: float = 0.0,
     learning_rate: float = 0.001,
     max_epochs: int = MLP_MAX_EPOCHS,
@@ -615,6 +797,35 @@ def fit_mlp_network(
     seed: int = 42,
 ) -> tuple[MLPRegressor, float, int]:
     seed = _normalized_seed(seed)
+    train_features = _validated_mlp_array(
+        "train_features",
+        train_features,
+        dimensions=2,
+    )
+    validation_features = _validated_mlp_array(
+        "validation_features",
+        validation_features,
+        dimensions=2,
+    )
+    train_targets = _validated_mlp_array(
+        "train_targets",
+        train_targets,
+        dimensions=1,
+    )
+    validation_targets = _validated_mlp_array(
+        "validation_targets",
+        validation_targets,
+        dimensions=1,
+    )
+    if train_features.shape[0] != train_targets.shape[0]:
+        raise ValueError("train feature and target row counts must match")
+    if validation_features.shape[0] != validation_targets.shape[0]:
+        raise ValueError("validation feature and target row counts must match")
+    if train_features.shape[1] != validation_features.shape[1]:
+        raise ValueError("train and validation feature widths must match")
+    hidden_dims = _validated_hidden_dims(hidden_dims)
+    dropout = _validated_dropout(dropout)
+    learning_rate = _validated_learning_rate(learning_rate)
     max_epochs = _bounded_positive_integer(
         "mlp",
         "max_epochs",
@@ -627,52 +838,19 @@ def fit_mlp_network(
         patience,
         MLP_EARLY_STOPPING_PATIENCE,
     )
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    model = MLPRegressor(
-        int(np.asarray(train_features).shape[1]),
-        hidden_dims=hidden_dims,
-        dropout=dropout,
-    )
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    loss_function = nn.MSELoss()
-    train_tensor = _tensor(train_features)
-    train_target_tensor = _tensor(train_targets).reshape(-1, 1)
-    validation_tensor = _tensor(validation_features)
-    validation_target_tensor = _tensor(validation_targets).reshape(-1, 1)
-    best_state = copy.deepcopy(model.state_dict())
-    best_validation_loss = float("inf")
-    best_epoch = -1
-    stale_epochs = 0
-
-    for epoch in range(max_epochs):
-        model.train()
-        optimizer.zero_grad()
-        loss = loss_function(model(train_tensor), train_target_tensor)
-        loss.backward()
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            validation_loss = float(
-                loss_function(
-                    model(validation_tensor),
-                    validation_target_tensor,
-                ).item()
-            )
-        if validation_loss < best_validation_loss:
-            best_validation_loss = validation_loss
-            best_state = copy.deepcopy(model.state_dict())
-            best_epoch = epoch
-            stale_epochs = 0
-        else:
-            stale_epochs += 1
-        if stale_epochs >= patience:
-            break
-
-    model.load_state_dict(best_state)
-    model.eval()
-    return model, best_validation_loss, best_epoch
+    with _MLP_TRAINING_LOCK, torch.random.fork_rng(devices=[]):
+        return _fit_mlp_network_with_seed(
+            train_features,
+            train_targets,
+            validation_features,
+            validation_targets,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            learning_rate=learning_rate,
+            max_epochs=max_epochs,
+            patience=patience,
+            seed=seed,
+        )
 
 
 class CatBoostCandidateAdapter:
@@ -693,6 +871,25 @@ class CatBoostCandidateAdapter:
         loss_function = params.pop("loss_function", "RMSE")
         if loss_function != "RMSE":
             raise ValueError("catboost loss_function must be RMSE")
+        if "depth" in params:
+            params["depth"] = _bounded_positive_integer(
+                "catboost",
+                "depth",
+                params["depth"],
+                16,
+            )
+        if "learning_rate" in params:
+            params["learning_rate"] = _finite_positive_real(
+                "catboost",
+                "learning_rate",
+                params["learning_rate"],
+            )
+        if "l2_leaf_reg" in params:
+            params["l2_leaf_reg"] = _finite_nonnegative_real(
+                "catboost",
+                "l2_leaf_reg",
+                params["l2_leaf_reg"],
+            )
         self.iterations = _bounded_positive_integer(
             "catboost",
             "iterations",
@@ -723,12 +920,14 @@ class CatBoostCandidateAdapter:
             cat_features=self.categorical_feature_indices,
         )
         self.best_iteration = -1
+        self._is_fitted = False
 
     def fit(
         self,
         train_frame: pd.DataFrame,
         validation_frame: pd.DataFrame | None = None,
     ):
+        self._is_fitted = False
         validation_frame = _require_validation_frame(validation_frame)
         train_features = _feature_frame(train_frame)
         validation_features = _feature_frame(validation_frame)
@@ -744,12 +943,19 @@ class CatBoostCandidateAdapter:
             verbose=False,
         )
         self.best_iteration = int(self.model.get_best_iteration())
+        self._is_fitted = True
         return self
 
     def predict(self, frame: pd.DataFrame) -> np.ndarray:
+        if not self._is_fitted:
+            raise RuntimeError(
+                "catboost adapter must be fitted before prediction"
+            )
         return _inr_predictions(self.model.predict(_feature_frame(frame)))
 
     def save(self, directory: Path) -> dict:
+        if not self._is_fitted:
+            raise RuntimeError("catboost adapter must be fitted before saving")
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         model_path = directory / "catboost.cbm"
@@ -777,6 +983,34 @@ class ExtraTreesCandidateAdapter:
                 "n_jobs",
             },
         )
+        for name in ("n_estimators", "min_samples_leaf"):
+            if name in params:
+                params[name] = _positive_integer(
+                    "extra_trees",
+                    name,
+                    params[name],
+                )
+        if "max_features" in params:
+            max_features = params["max_features"]
+            if (
+                isinstance(max_features, bool)
+                or not isinstance(max_features, Real)
+                or not np.isfinite(float(max_features))
+                or not 0 < float(max_features) <= 1
+            ):
+                raise ValueError(
+                    "extra_trees max_features must be finite and between 0 and 1"
+                )
+            params["max_features"] = float(max_features)
+        if "n_jobs" in params:
+            n_jobs = params["n_jobs"]
+            if (
+                isinstance(n_jobs, bool)
+                or not isinstance(n_jobs, Integral)
+                or int(n_jobs) == 0
+            ):
+                raise ValueError("extra_trees n_jobs must be a nonzero integer")
+            params["n_jobs"] = int(n_jobs)
         self.config = config
         self.seed = _normalized_seed(seed)
         self.preprocessor = _build_fold_preprocessor(scale_numeric=False)
@@ -784,23 +1018,32 @@ class ExtraTreesCandidateAdapter:
             **params,
             random_state=self.seed,
         )
+        self._is_fitted = False
 
     def fit(
         self,
         train_frame: pd.DataFrame,
         validation_frame: pd.DataFrame | None = None,
     ):
+        self._is_fitted = False
         train_features = self.preprocessor.fit_transform(
             _feature_frame(train_frame)
         )
         self.model.fit(train_features, _transformed_target(train_frame))
+        self._is_fitted = True
         return self
 
     def predict(self, frame: pd.DataFrame) -> np.ndarray:
+        if not self._is_fitted:
+            raise RuntimeError(
+                "extra_trees adapter must be fitted before prediction"
+            )
         features = self.preprocessor.transform(_feature_frame(frame))
         return _inr_predictions(self.model.predict(features))
 
     def save(self, directory: Path) -> dict:
+        if not self._is_fitted:
+            raise RuntimeError("extra_trees adapter must be fitted before saving")
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         bundle_path = directory / "extra_trees.joblib"
@@ -834,32 +1077,13 @@ class MLPCandidateAdapter:
                 "early_stopping_patience",
             },
         )
-        hidden_dims = params.pop("hidden_dims", (128, 64))
-        if (
-            not isinstance(hidden_dims, tuple)
-            or not hidden_dims
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, Integral)
-                or int(value) <= 0
-                for value in hidden_dims
-            )
-        ):
-            raise ValueError("mlp hidden_dims must be positive integers")
-        dropout = params.pop("dropout", 0.0)
-        if (
-            isinstance(dropout, bool)
-            or not isinstance(dropout, Real)
-            or not 0 <= float(dropout) < 1
-        ):
-            raise ValueError("mlp dropout must be between 0 and 1")
-        learning_rate = params.pop("learning_rate", 0.001)
-        if (
-            isinstance(learning_rate, bool)
-            or not isinstance(learning_rate, Real)
-            or float(learning_rate) <= 0
-        ):
-            raise ValueError("mlp learning_rate must be positive")
+        hidden_dims = _validated_hidden_dims(
+            params.pop("hidden_dims", (128, 64))
+        )
+        dropout = _validated_dropout(params.pop("dropout", 0.0))
+        learning_rate = _validated_learning_rate(
+            params.pop("learning_rate", 0.001)
+        )
         self.max_epochs = _bounded_positive_integer(
             "mlp",
             "max_epochs",
@@ -970,15 +1194,16 @@ def evaluate_candidate(
     frame: pd.DataFrame,
     manifest: Mapping[str, Any],
     config: CandidateConfig,
+    *,
+    collection_year: int,
     seed: int = 42,
 ) -> dict[str, Any]:
+    collection_year = _normalized_collection_year(collection_year)
     folds = _validated_evaluation_folds(frame, manifest, config, seed)
     fold_metrics = []
     observed_train_indices = []
     observed_validation_indices = []
     best_iterations = []
-    collection_year = date.today().year
-
     for train_ids, validation_ids in folds:
         train_source = frame.loc[train_ids].copy()
         validation_source = frame.loc[validation_ids].copy()
@@ -1010,6 +1235,7 @@ def evaluate_candidate(
         "model_type": config.model_type,
         "config": _json_safe_value(config.params),
         "complexity": config.complexity,
+        "collection_year": collection_year,
         "candidate": config.to_dict(),
         "fold_metrics": fold_metrics,
         "cv": cv,
