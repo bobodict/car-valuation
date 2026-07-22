@@ -7,10 +7,10 @@ import pandas as pd
 
 from scripts.train_model import (
     assess_quality_gate,
-    calculate_metrics,
     publish_artifacts,
     split_dataset,
 )
+from services.model_competition import calculate_metrics
 
 
 def make_fixture_frame(size=30):
