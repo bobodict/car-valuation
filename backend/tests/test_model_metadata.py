@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -260,6 +261,56 @@ class ModelMetadataTests(unittest.TestCase):
                     response = MetricsResponse.model_validate(result).model_dump()
                     self.assertEqual(response["model_type"], expected[0])
             metrics_service.load_metrics.cache_clear()
+
+    def test_metrics_refresh_after_atomic_replacement_without_cache_clear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "metrics.json"
+            replacement = root / "metrics.next.json"
+            old_artifact = make_metrics(
+                artifact_version="3.0.0",
+                model_version="old-v3",
+                model_type="old_type",
+                quality_gate="fail",
+            )
+            new_artifact = make_metrics(
+                artifact_version="3.1.0",
+                model_version="new-v3",
+                model_type="new_type",
+                quality_gate="pass",
+            )
+            path.write_text(
+                json.dumps(old_artifact, sort_keys=True), encoding="utf-8"
+            )
+            old_stat = path.stat()
+            replacement.write_text(
+                json.dumps(new_artifact, sort_keys=True), encoding="utf-8"
+            )
+            self.assertEqual(path.stat().st_size, replacement.stat().st_size)
+            os.utime(
+                replacement,
+                ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns),
+            )
+
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with patch.object(
+                    metrics_service,
+                    "settings",
+                    SimpleNamespace(metrics_path=path),
+                ):
+                    old_metrics = metrics_service.load_metrics()
+                    replacement.replace(path)
+                    self.assertEqual(path.stat().st_mtime_ns, old_stat.st_mtime_ns)
+                    new_metrics = metrics_service.load_metrics()
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        self.assertEqual(old_metrics["model_version"], "old-v3")
+        self.assertEqual(new_metrics["model_version"], "new-v3")
+        self.assertEqual(new_metrics["model_type"], "new_type")
+        self.assertEqual(new_metrics["feature_version"], "3.1.0")
+        self.assertEqual(new_metrics["quality_gate"], "pass")
 
     def test_artifact_version_only_v3_metrics_flow_to_health_and_prediction(self):
         with tempfile.TemporaryDirectory() as directory:
