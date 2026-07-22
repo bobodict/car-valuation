@@ -1,6 +1,7 @@
 """Train, audit, and atomically publish a v3 vehicle valuation model."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -88,13 +89,21 @@ class RefitResult:
     development_mean: float
 
 
-@dataclass(frozen=True)
+@dataclass
+class PublicationMutex:
+    kind: str
+    resource: Any
+    held: bool = True
+
+
+@dataclass
 class PublicationLock:
     path: Path
     formal_dir: Path
     token: str
     owner: dict[str, int]
     acquired_at: str
+    mutex: PublicationMutex
 
 
 def _utc_now() -> datetime:
@@ -2085,13 +2094,116 @@ def _write_ownership_sentinel(directory: Path) -> Path:
     )
 
 
-def _publication_lock_path(formal_dir: Path) -> Path:
-    return formal_dir.with_name(f".{formal_dir.name}.publish.lock")
+def _publication_lock_prefix(formal_dir: Path) -> str:
+    return f".{formal_dir.name}.publish.lock-"
+
+
+def _publication_lock_path(formal_dir: Path, token: str) -> Path:
+    if not _is_publication_lock_token(token):
+        raise ValueError("publication lock token is invalid")
+    return formal_dir.with_name(f"{_publication_lock_prefix(formal_dir)}{token}")
 
 
 def _validate_publication_lock_path(lock_dir: Path, formal_dir: Path) -> None:
-    if lock_dir != _publication_lock_path(formal_dir) or lock_dir.parent != formal_dir.parent:
+    prefix = _publication_lock_prefix(formal_dir)
+    token = lock_dir.name.removeprefix(prefix)
+    if (
+        lock_dir.parent != formal_dir.parent
+        or not lock_dir.name.startswith(prefix)
+        or not _is_publication_lock_token(token)
+        or lock_dir != _publication_lock_path(formal_dir, token)
+    ):
         raise ValueError("refusing publication lock operation outside exact lock path")
+
+
+def _publication_mutex_name(formal_dir: Path) -> str:
+    identity = str(formal_dir.resolve(strict=False)).casefold().encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()
+    return f"Local\\car-valuation-model-publish-{digest}"
+
+
+def _acquire_publication_mutex(formal_dir: Path) -> PublicationMutex:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        )
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateMutexW(
+            None,
+            False,
+            _publication_mutex_name(formal_dir),
+        )
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        wait_result = kernel32.WaitForSingleObject(handle, 0)
+        if wait_result not in {0x00000000, 0x00000080}:
+            kernel32.CloseHandle(handle)
+            if wait_result == 0x00000102:
+                raise FileExistsError(
+                    "another publication owns the model directory lock"
+                )
+            raise ctypes.WinError(ctypes.get_last_error())
+        return PublicationMutex("windows", handle)
+
+    import fcntl
+
+    guard_path = formal_dir.with_name(f".{formal_dir.name}.publish.mutex")
+    guard_file = guard_path.open("a+b")
+    try:
+        fcntl.flock(guard_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        guard_file.close()
+        raise FileExistsError(
+            "another publication owns the model directory lock"
+        ) from None
+    return PublicationMutex("posix", guard_file)
+
+
+def _release_publication_mutex(mutex: PublicationMutex) -> None:
+    if not mutex.held:
+        return
+    if mutex.kind == "windows":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+        kernel32.ReleaseMutex.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        if not kernel32.ReleaseMutex(mutex.resource):
+            raise ctypes.WinError(ctypes.get_last_error())
+        mutex.held = False
+        kernel32.CloseHandle(mutex.resource)
+        return
+
+    import fcntl
+
+    try:
+        fcntl.flock(mutex.resource.fileno(), fcntl.LOCK_UN)
+    finally:
+        mutex.held = False
+        mutex.resource.close()
+
+
+def _publication_lock_paths(formal_dir: Path) -> list[Path]:
+    prefix = _publication_lock_prefix(formal_dir)
+    return sorted(
+        path
+        for path in formal_dir.parent.iterdir()
+        if path.name.startswith(prefix)
+    )
 
 
 def _lock_payload(
@@ -2153,10 +2265,13 @@ def _mark_publication_lock(
         _read_owned_publication_lock(lock)
     elif state != "active":
         raise PermissionError("publication lock owner metadata is missing")
-    return _write_json(
+    marked = _write_json(
         metadata_path,
         _lock_payload(lock, state, error),
     )
+    if state in {"completed", "failed"}:
+        _release_publication_mutex(lock.mutex)
+    return marked
 
 
 def _recover_terminal_publication_lock(lock_dir: Path, formal_dir: Path) -> bool:
@@ -2185,27 +2300,33 @@ def _recover_terminal_publication_lock(lock_dir: Path, formal_dir: Path) -> bool
 
 
 def _acquire_publication_lock(formal_dir: Path) -> PublicationLock:
-    lock_dir = _publication_lock_path(formal_dir)
-    _validate_publication_lock_path(lock_dir, formal_dir)
-    for attempt in range(2):
-        try:
-            lock_dir.mkdir()
-        except FileExistsError:
-            if attempt == 0 and _recover_terminal_publication_lock(
-                lock_dir, formal_dir
-            ):
-                continue
-            raise FileExistsError(
-                f"another publication owns the model directory lock: {lock_dir}"
-            ) from None
+    mutex = _acquire_publication_mutex(formal_dir)
+    lock_dir = None
+    try:
+        for existing_lock in _publication_lock_paths(formal_dir):
+            try:
+                recovered = _recover_terminal_publication_lock(
+                    existing_lock,
+                    formal_dir,
+                )
+            except FileNotFoundError:
+                recovered = True
+            if not recovered:
+                raise FileExistsError(
+                    f"another publication owns the model directory lock: {existing_lock}"
+                )
 
+        token = uuid.uuid4().hex
+        lock_dir = _publication_lock_path(formal_dir, token)
+        lock_dir.mkdir()
         acquired_at = _utc_now().isoformat()
         lock = PublicationLock(
             path=lock_dir,
             formal_dir=formal_dir,
-            token=uuid.uuid4().hex,
+            token=token,
             owner={"pid": os.getpid(), "thread_id": threading.get_ident()},
             acquired_at=acquired_at,
+            mutex=mutex,
         )
         try:
             _mark_publication_lock(lock, "active")
@@ -2213,12 +2334,17 @@ def _acquire_publication_lock(formal_dir: Path) -> PublicationLock:
             shutil.rmtree(lock_dir, ignore_errors=True)
             raise
         return lock
-    raise RuntimeError("publication lock acquisition retry was exhausted")
+    except Exception:
+        _release_publication_mutex(mutex)
+        raise
 
 
 def _release_publication_lock(lock: PublicationLock) -> None:
-    _read_owned_publication_lock(lock)
-    shutil.rmtree(lock.path)
+    try:
+        _read_owned_publication_lock(lock)
+        shutil.rmtree(lock.path)
+    finally:
+        _release_publication_mutex(lock.mutex)
 
 
 @contextmanager

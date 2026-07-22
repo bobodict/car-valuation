@@ -2081,13 +2081,12 @@ class TrainingPipelineTests(unittest.TestCase):
             first = root / "first"
             second = root / "second"
             formal = root / "models"
-            lock_dir = root / ".models.publish.lock"
             write_publishable_experiment(first)
             write_publishable_experiment(second)
             real_rmtree = train_model.shutil.rmtree
 
             def fail_lock_release(path, *args, **kwargs):
-                if Path(path) == lock_dir:
+                if Path(path).name.startswith(".models.publish.lock-"):
                     raise PermissionError("simulated lock release failure")
                 return real_rmtree(path, *args, **kwargs)
 
@@ -2100,6 +2099,9 @@ class TrainingPipelineTests(unittest.TestCase):
 
             self.assertTrue(published)
             self.assertTrue((formal / "winner.bin").is_file())
+            lock_dirs = list(root.glob(".models.publish.lock-*"))
+            self.assertEqual(len(lock_dirs), 1)
+            lock_dir = lock_dirs[0]
             self.assertTrue(lock_dir.is_dir())
             lock_metadata = json.loads(
                 (lock_dir / "lock.json").read_text(encoding="utf-8"),
@@ -2115,7 +2117,7 @@ class TrainingPipelineTests(unittest.TestCase):
             (formal / "first-marker.bin").write_bytes(b"first")
             self.assertTrue(publish_experiment(second, formal))
             self.assertFalse((formal / "first-marker.bin").exists())
-            self.assertFalse(lock_dir.exists())
+            self.assertEqual(list(root.glob(".models.publish.lock-*")), [])
 
     def test_failed_terminal_lock_is_recovered_without_masking_original_error(self):
         publication_lock = self.require_function("_publication_lock")
@@ -2157,7 +2159,6 @@ class TrainingPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             formal = root / "models"
-            lock_path = root / ".models.publish.lock"
 
             old_lock = acquire_lock(formal)
             mark_lock(old_lock, "completed")
@@ -2169,7 +2170,7 @@ class TrainingPipelineTests(unittest.TestCase):
                 release_lock(old_lock)
 
             metadata = json.loads(
-                (lock_path / "lock.json").read_text(encoding="utf-8")
+                (current_lock.path / "lock.json").read_text(encoding="utf-8")
             )
             self.assertEqual(metadata["state"], "active")
             self.assertEqual(metadata["token"], current_lock.token)
@@ -2178,7 +2179,77 @@ class TrainingPipelineTests(unittest.TestCase):
 
             mark_lock(current_lock, "completed")
             release_lock(current_lock)
-            self.assertFalse(lock_path.exists())
+            self.assertEqual(list(root.glob(".models.publish.lock-*")), [])
+
+    def test_validated_old_release_cannot_delete_new_owner_lock(self):
+        acquire_lock = self.require_function("_acquire_publication_lock")
+        mark_lock = self.require_function("_mark_publication_lock")
+        release_lock = self.require_function("_release_publication_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            formal = root / "models"
+            old_lock = acquire_lock(formal)
+            mark_lock(old_lock, "completed")
+            old_release_reached_delete = threading.Event()
+            allow_old_delete = threading.Event()
+            old_outcome = {}
+            real_rmtree = train_model.shutil.rmtree
+
+            def pause_old_delete(path, *args, **kwargs):
+                if (
+                    threading.current_thread().name == "delayed-old-release"
+                    and Path(path) == old_lock.path
+                ):
+                    old_release_reached_delete.set()
+                    if not allow_old_delete.wait(timeout=5):
+                        raise TimeoutError("old release was not resumed")
+                return real_rmtree(path, *args, **kwargs)
+
+            def release_old_owner():
+                try:
+                    release_lock(old_lock)
+                except Exception as exc:
+                    old_outcome["error"] = exc
+
+            with patch.object(
+                train_model.shutil,
+                "rmtree",
+                side_effect=pause_old_delete,
+            ):
+                old_worker = threading.Thread(
+                    target=release_old_owner,
+                    name="delayed-old-release",
+                )
+                old_worker.start()
+                self.assertTrue(old_release_reached_delete.wait(timeout=5))
+                current_lock = acquire_lock(formal)
+                allow_old_delete.set()
+                old_worker.join(timeout=5)
+
+            self.assertFalse(old_worker.is_alive())
+            current_metadata = json.loads(
+                (current_lock.path / "lock.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(current_metadata["state"], "active")
+            self.assertEqual(current_metadata["token"], current_lock.token)
+
+            contender_outcome = {}
+
+            def acquire_contender():
+                try:
+                    contender_outcome["lock"] = acquire_lock(formal)
+                except Exception as exc:
+                    contender_outcome["error"] = exc
+
+            contender = threading.Thread(target=acquire_contender)
+            contender.start()
+            contender.join(timeout=5)
+            self.assertFalse(contender.is_alive())
+            self.assertIsInstance(contender_outcome.get("error"), FileExistsError)
+            self.assertNotIn("lock", contender_outcome)
+
+            mark_lock(current_lock, "completed")
+            release_lock(current_lock)
 
     def test_post_swap_backup_cleanup_failure_keeps_success_and_recovery_copy(self):
         publish_experiment = self.require_function("publish_experiment")
