@@ -1,0 +1,35 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and generated files
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+.vite/
+
+# Local artifacts and duplicated working copies
+car-valuation-submit.zip
+qianduan/
+/models/
+/services/
+/database.py
+/main.py
+/models.py
+/predict_service.py
+/schemas.py
+
+# IDE and OS files
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db

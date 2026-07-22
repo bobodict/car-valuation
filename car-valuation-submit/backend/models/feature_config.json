@@ -1,0 +1,35 @@
+{
+  "target_col": "price",
+  "feature_cols": [
+    "mileage",
+    "displacement",
+    "seats",
+    "owner_count",
+    "car_age",
+    "brand",
+    "model",
+    "city",
+    "transmission",
+    "fuel_type",
+    "vehicle_type",
+    "color",
+    "accident_history"
+  ],
+  "numeric_features": [
+    "mileage",
+    "displacement",
+    "seats",
+    "owner_count",
+    "car_age"
+  ],
+  "categorical_features": [
+    "brand",
+    "model",
+    "city",
+    "transmission",
+    "fuel_type",
+    "vehicle_type",
+    "color",
+    "accident_history"
+  ]
+}

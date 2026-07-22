@@ -1,0 +1,14 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+SQLAlchemy>=2.0.0
+pymysql>=1.1.0
+python-multipart>=0.0.9
+
+pydantic>=2.6.0
+pydantic-core>=2.16.0
+
+pandas>=2.0.0
+joblib>=1.4.0
+scikit-learn==1.6.1
+torch>=2.3.0
