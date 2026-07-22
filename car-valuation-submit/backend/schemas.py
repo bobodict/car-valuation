@@ -50,20 +50,55 @@ class TestMetrics(BaseModel):
     mae: float
     r2: float
     acc_10: float = Field(ge=0, le=1)
+    baseline_rmse: float | None = None
+    baseline_r2: float | None = None
+    evaluation_scope: str | None = None
 
 
 class MetricsResponse(BaseModel):
-    model_status: Literal["experimental"]
+    model_status: Literal["experimental", "usable"] = "experimental"
+    quality_gate: Literal["pass", "fail"] = "fail"
     best_val_rmse: float | None = None
     test_metrics: TestMetrics
+    currency: str = "INR"
+    price_unit: str = "INR"
+    mileage_unit: str = "km"
+    data_source: dict = Field(default_factory=dict)
+    model_version: str = "unknown"
+    sample_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ModelHealthResponse(BaseModel):
-    model_status: Literal["experimental"]
+    model_status: Literal["experimental", "usable"]
     quality_gate: Literal["pass", "fail"]
     warnings: list[str] = Field(default_factory=list)
     metrics: TestMetrics
     data_status: str
+    currency: str = "INR"
+    price_unit: str = "INR"
+    mileage_unit: str = "km"
+    data_source: dict = Field(default_factory=dict)
+    model_version: str = "unknown"
+    sample_count: int = 0
+
+
+class ModelCardResponse(BaseModel):
+    artifact_version: str
+    feature_version: str
+    model_version: str
+    currency: str
+    price_unit: str
+    mileage_unit: str
+    sample_count: int = Field(gt=0)
+    data_source: dict
+    split: dict
+    thresholds: dict
+    quality_gate: Literal["pass", "fail"]
+    test_metrics: TestMetrics
+    category_options: dict[str, list[str]] = Field(default_factory=dict)
+    feature_descriptions: dict[str, str] = Field(default_factory=dict)
+    limitations: list[str] = Field(default_factory=list)
 
 
 class AssistantRequest(BaseModel):

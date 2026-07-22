@@ -27,11 +27,22 @@ def assess_metrics(metrics: dict) -> dict:
 def get_model_health() -> dict:
     artifact = load_metrics()
     metrics = artifact["test_metrics"]
-    assessment = assess_metrics(metrics)
+    quality_gate = artifact.get("quality_gate")
+    warnings = list(artifact.get("warnings", []))
+    if quality_gate not in {"pass", "fail"}:
+        assessment = assess_metrics(metrics)
+        quality_gate = assessment["quality_gate"]
+        warnings = assessment["warnings"]
     return {
-        "model_status": "experimental",
-        "quality_gate": assessment["quality_gate"],
-        "warnings": assessment["warnings"],
+        "model_status": "usable" if quality_gate == "pass" else "experimental",
+        "quality_gate": quality_gate,
+        "warnings": warnings,
         "metrics": metrics,
-        "data_status": "training dataset and original training script are not included",
+        "data_status": "public source and reproducible training pipeline are recorded",
+        "currency": artifact.get("currency", "INR"),
+        "price_unit": artifact.get("price_unit", "INR"),
+        "mileage_unit": artifact.get("mileage_unit", "km"),
+        "data_source": artifact.get("data_source", {}),
+        "model_version": artifact.get("model_version", "unknown"),
+        "sample_count": artifact.get("sample_count", 0),
     }

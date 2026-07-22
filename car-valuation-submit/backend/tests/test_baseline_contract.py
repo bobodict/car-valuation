@@ -112,8 +112,11 @@ class MetricsTests(unittest.TestCase):
     def test_artifact_metrics_are_loaded_from_backend_model_directory(self):
         metrics = load_metrics()
 
-        self.assertEqual(metrics["test_metrics"]["r2"], -0.015273571014404297)
-        self.assertEqual(metrics["test_metrics"]["acc_10"], 0.11777777777777777)
+        self.assertAlmostEqual(metrics["test_metrics"]["r2"], 0.8635845112741601)
+        self.assertAlmostEqual(metrics["test_metrics"]["acc_10"], 0.2912621359223301)
+        self.assertEqual(metrics["quality_gate"], "fail")
+        self.assertEqual(metrics["currency"], "INR")
+        self.assertEqual(metrics["mileage_unit"], "km")
 
 
 if __name__ == "__main__":

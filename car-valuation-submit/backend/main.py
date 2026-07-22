@@ -16,6 +16,7 @@ from schemas import (
     HistoryOut,
     HistoryQuery,
     ModelHealthResponse,
+    ModelCardResponse,
     MetricsResponse,
     PredictRequest,
     PredictResponse,
@@ -23,6 +24,7 @@ from schemas import (
 from services.assistant_service import answer_user_message
 from services.llm_client import LLMClientError, LLMNotConfiguredError
 from services.metrics_service import load_metrics
+from services.model_metadata import load_model_card
 from services.model_service import ModelServiceError, call_model_api
 from services.model_quality_service import get_model_health
 
@@ -95,6 +97,11 @@ def get_metrics():
 @app.get("/api/model-health", response_model=ModelHealthResponse)
 def model_health():
     return get_model_health()
+
+
+@app.get("/api/model-card", response_model=ModelCardResponse)
+def model_card():
+    return load_model_card()
 
 
 @app.post("/api/assistant", response_model=AssistantResponse)
