@@ -3,8 +3,11 @@
 import argparse
 import json
 import math
+import os
 import shutil
+import threading
 import uuid
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -70,6 +73,8 @@ _MODEL_OWNER = "car-valuation-model-publication"
 _MODEL_SENTINEL_VERSION = 1
 RUN_STATUS_FILENAME = "run_status.json"
 FAILURE_RECORD_FILENAME = "failure.json"
+PUBLICATION_LOCK_FILENAME = "lock.json"
+PUBLICATION_WARNING_FILENAME = "publication_warning.json"
 
 
 @dataclass
@@ -81,6 +86,15 @@ class RefitResult:
     validation_indices: list[int]
     collection_year: int
     development_mean: float
+
+
+@dataclass(frozen=True)
+class PublicationLock:
+    path: Path
+    formal_dir: Path
+    token: str
+    owner: dict[str, int]
+    acquired_at: str
 
 
 def _utc_now() -> datetime:
@@ -1253,6 +1267,259 @@ def _load_saved_model_for_smoke(
     raise ValueError(f"unsupported model_type in manifest: {model_type}")
 
 
+def _validated_report_row_ids(
+    name: str,
+    values: Any,
+    *,
+    allow_empty: bool = False,
+) -> list[int]:
+    if not isinstance(values, list):
+        raise TypeError(f"{name} must be a list of integer row IDs")
+    row_ids = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise TypeError(f"{name} must contain only integer non-bool row IDs")
+        row_ids.append(int(value))
+    if not allow_empty and not row_ids:
+        raise ValueError(f"{name} must not be empty")
+    if len(row_ids) != len(set(row_ids)):
+        raise ValueError(f"{name} must contain unique row IDs")
+    return row_ids
+
+
+def _validated_report_count(name: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return int(value)
+
+
+def _validate_split_report_semantics(
+    split_manifest: Mapping[str, Any],
+    split_indices: Mapping[str, Any],
+    refit: Mapping[str, Any],
+    counts: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+    model_card: Mapping[str, Any],
+    model_type: str,
+) -> set[int]:
+    development = _validated_report_row_ids(
+        "split_indices.development", split_indices.get("development")
+    )
+    test = _validated_report_row_ids("split_indices.test", split_indices.get("test"))
+    development_set = set(development)
+    test_set = set(test)
+    if not development_set.isdisjoint(test_set):
+        raise ValueError("development and test split row IDs must be disjoint")
+
+    total_count = _validated_report_count("counts.total", counts.get("total"))
+    development_count = _validated_report_count(
+        "counts.development", counts.get("development")
+    )
+    test_count = _validated_report_count("counts.test", counts.get("test"))
+    if (
+        development_set | test_set != set(range(total_count))
+        or len(development) != development_count
+        or len(test) != test_count
+    ):
+        raise ValueError("split membership and manifest counts must agree")
+
+    expected_split_counts = {
+        "train": len(split_indices.get("train", [])),
+        "validation": len(split_indices.get("validation", [])),
+        "development": development_count,
+        "test": test_count,
+    }
+    if (
+        metrics.get("sample_count") != total_count
+        or metrics.get("split") != expected_split_counts
+        or model_card.get("sample_count") != total_count
+        or model_card.get("split") != expected_split_counts
+    ):
+        raise ValueError("metrics and model-card split counts must agree")
+
+    folds = split_indices.get("folds")
+    if not isinstance(folds, list) or not folds:
+        raise ValueError("split_indices.folds must be a nonempty list")
+    n_splits = split_manifest.get("n_splits")
+    if (
+        isinstance(n_splits, bool)
+        or not isinstance(n_splits, Integral)
+        or int(n_splits) != len(folds)
+        or int(n_splits) < 2
+    ):
+        raise ValueError("split manifest n_splits must match at least two folds")
+    validation_coverage: Counter[int] = Counter()
+    fold_numbers = []
+    for position, fold in enumerate(folds):
+        if not isinstance(fold, Mapping):
+            raise TypeError(f"split fold {position} must be an object")
+        fold_number = fold.get("fold")
+        if (
+            isinstance(fold_number, bool)
+            or not isinstance(fold_number, Integral)
+        ):
+            raise TypeError("split fold numbers must be integers")
+        fold_numbers.append(int(fold_number))
+        train_ids = _validated_report_row_ids(
+            f"split fold {position}.train", fold.get("train")
+        )
+        validation_ids = _validated_report_row_ids(
+            f"split fold {position}.validation", fold.get("validation")
+        )
+        train_set = set(train_ids)
+        validation_set = set(validation_ids)
+        if (
+            not train_set.isdisjoint(validation_set)
+            or train_set | validation_set != development_set
+        ):
+            raise ValueError(
+                "each fold train/validation pair must disjointly partition development"
+            )
+        validation_coverage.update(validation_ids)
+    if sorted(fold_numbers) != list(range(len(folds))) or any(
+        validation_coverage[row_id] != 1 for row_id in development
+    ):
+        raise ValueError("validation folds must cover development exactly once")
+
+    train_ids = _validated_report_row_ids(
+        "refit train_indices", refit.get("train_indices")
+    )
+    validation_ids = _validated_report_row_ids(
+        "refit validation_indices",
+        refit.get("validation_indices"),
+        allow_empty=True,
+    )
+    train_set = set(train_ids)
+    validation_set = set(validation_ids)
+    if (
+        not train_set.isdisjoint(validation_set)
+        or not train_set.issubset(development_set)
+        or not validation_set.issubset(development_set)
+    ):
+        raise ValueError("refit rows must be disjoint subsets of development")
+    strategy = refit.get("strategy")
+    if strategy == "full_development" and model_type == "extra_trees":
+        coherent = train_set == development_set and not validation_set
+    elif (
+        strategy == "deterministic_development_holdback"
+        and model_type in {"catboost", "mlp"}
+    ):
+        coherent = (
+            bool(train_set)
+            and bool(validation_set)
+            and train_set | validation_set == development_set
+        )
+    else:
+        coherent = False
+    if not coherent:
+        raise ValueError("refit strategy and development membership are incoherent")
+    return development_set
+
+
+def _validate_feature_report_semantics(
+    manifest: Mapping[str, Any],
+    feature_config: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+    leaderboard: Mapping[str, Any],
+    model_card: Mapping[str, Any],
+) -> tuple[int, int]:
+    if (
+        feature_config.get("target_col") != TARGET_COL
+        or feature_config.get("feature_cols") != list(MODEL_FEATURES)
+        or feature_config.get("numeric_features") != list(NUMERIC_FEATURES)
+        or feature_config.get("categorical_features") != list(CATEGORICAL_FEATURES)
+    ):
+        raise ValueError("feature_config.json must use the canonical ordered feature contract")
+    model_metadata = manifest.get("model_artifact_metadata")
+    transforms = {
+        manifest.get("target_transform"),
+        feature_config.get("target_transform"),
+        model_card.get("target_transform"),
+        model_metadata.get("target_transform")
+        if isinstance(model_metadata, Mapping)
+        else None,
+    }
+    if transforms != {"log1p"}:
+        raise ValueError("all model reports must use target_transform log1p")
+
+    collection_year = _validate_collection_year(manifest.get("collection_year"))
+    if {
+        feature_config.get("collection_year"),
+        metrics.get("collection_year"),
+        leaderboard.get("collection_year"),
+        model_card.get("collection_year"),
+    } != {collection_year}:
+        raise ValueError("all model reports must agree on collection_year")
+    seed = manifest.get("seed")
+    if (
+        isinstance(seed, bool)
+        or not isinstance(seed, Integral)
+        or not 0 <= int(seed) <= 2**32 - 1
+    ):
+        raise ValueError("model seed must be an integer in uint32 range")
+    seed = int(seed)
+    split_manifest = manifest.get("split_manifest")
+    if not isinstance(split_manifest, Mapping) or {
+        split_manifest.get("seed"),
+        metrics.get("seed"),
+        leaderboard.get("seed"),
+        model_card.get("seed"),
+    } != {seed}:
+        raise ValueError("all model reports must agree on seed")
+    return collection_year, seed
+
+
+def _validate_error_analysis_semantics(
+    error_analysis: Mapping[str, Any],
+    test_count: int,
+) -> None:
+    price_quartiles = error_analysis.get("price_quartiles")
+    family_frequency = error_analysis.get("model_family_frequency")
+    seen_status = error_analysis.get("full_model_seen_status")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (price_quartiles, family_frequency, seen_status)
+    ):
+        raise TypeError("error-analysis subgroup reports must be objects")
+    boundaries = price_quartiles.get("boundaries_inr")
+    if (
+        price_quartiles.get("definition_source") != "development_only"
+        or price_quartiles.get("boundary_source") != "development_actual_price"
+        or not isinstance(boundaries, list)
+        or len(boundaries) != 3
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+            for value in boundaries
+        )
+        or [float(value) for value in boundaries]
+        != sorted(float(value) for value in boundaries)
+    ):
+        raise ValueError("price quartiles must use finite ordered development boundaries")
+    if family_frequency.get("frequency_source") != "development_only":
+        raise ValueError("model-family frequency must be defined from development only")
+    if seen_status.get("seen_set_source") != "development_only":
+        raise ValueError("seen-model status must be defined from development only")
+
+    for name, report, expected_groups in (
+        ("price quartiles", price_quartiles, 4),
+        ("model-family frequency", family_frequency, 2),
+        ("seen-model status", seen_status, 2),
+    ):
+        groups = report.get("groups")
+        if not isinstance(groups, list) or len(groups) != expected_groups:
+            raise ValueError(f"{name} must contain the canonical groups")
+        group_count = sum(
+            _validated_report_count(f"{name} group count", group.get("count"))
+            if isinstance(group, Mapping)
+            else -1
+            for group in groups
+        )
+        if group_count != test_count:
+            raise ValueError(f"{name} counts must sum to the recorded test count")
+
+
 def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
     if not experiment_dir.is_dir():
         raise FileNotFoundError(f"experiment directory does not exist: {experiment_dir}")
@@ -1280,6 +1547,9 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
             "refit_strategy",
             "split_manifest",
             "split_indices",
+            "collection_year",
+            "seed",
+            "target_transform",
             "provenance",
             "units",
             "counts",
@@ -1289,7 +1559,10 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
             "model_version",
             "target_col",
             "feature_cols",
+            "numeric_features",
+            "categorical_features",
             "target_transform",
+            "collection_year",
             "category_options",
             "currency",
             "price_unit",
@@ -1308,6 +1581,10 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
             "thresholds",
             "split_manifest",
             "split_indices",
+            "seed",
+            "collection_year",
+            "sample_count",
+            "split",
         },
         "leaderboard.json": {
             "model_version",
@@ -1318,6 +1595,8 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
             "candidate_count",
             "candidates",
             "outer_test_metrics_in_candidates",
+            "seed",
+            "collection_year",
         },
         "error_analysis.json": {
             "model_version",
@@ -1334,6 +1613,8 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
             "model_version",
             "model_type",
             "winner",
+            "collection_year",
+            "seed",
             "data_source",
             "currency",
             "price_unit",
@@ -1345,6 +1626,7 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
             "warnings",
             "test_metrics",
             "counts",
+            "target_transform",
             "refit_strategy",
             "development_mean_baseline",
             "cv_selection",
@@ -1386,6 +1668,14 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
     } != {model_type}:
         raise ValueError("experiment reports must agree on model_type")
 
+    collection_year, seed = _validate_feature_report_semantics(
+        manifest,
+        feature_config,
+        metrics,
+        leaderboard,
+        model_card,
+    )
+
     split_manifest = manifest["split_manifest"]
     split_indices = manifest["split_indices"]
     if not isinstance(split_manifest, Mapping) or not isinstance(
@@ -1405,13 +1695,22 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
     ) != refit.get("validation_indices"):
         raise ValueError("refit strategy indices must agree with split_indices")
 
-    development_ids = {
-        int(value) for value in split_indices.get("development", [])
-    }
+    counts = manifest["counts"]
+    if not isinstance(counts, Mapping) or model_card["counts"] != counts:
+        raise ValueError("model manifest and model card counts must agree")
+    development_ids = _validate_split_report_semantics(
+        split_manifest,
+        split_indices,
+        refit,
+        counts,
+        metrics,
+        model_card,
+        model_type,
+    )
     winner = _validated_candidate_result(
         manifest["winner"],
         _winner_config(manifest["winner"]),
-        int(manifest["collection_year"]),
+        collection_year,
         development_ids,
     )
     if model_card["winner"] != winner:
@@ -1429,7 +1728,7 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
         _validated_candidate_result(
             candidate,
             _winner_config(candidate),
-            int(manifest["collection_year"]),
+            collection_year,
             development_ids,
         )
         for candidate in candidates
@@ -1449,6 +1748,16 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
         or matching_winners[0] != winner
     ):
         raise ValueError("leaderboard must describe CV-only winner selection")
+    cv_selection = model_card["cv_selection"]
+    if (
+        not isinstance(cv_selection, Mapping)
+        or cv_selection.get("scope") != "development_cv_only"
+        or cv_selection.get("winner") != winner_name
+        or cv_selection.get("winner_cv") != winner["cv"]
+        or cv_selection.get("candidate_count") != len(validated_candidates)
+        or counts.get("candidates") != len(validated_candidates)
+    ):
+        raise ValueError("model card CV selection must agree with ranked leaderboard")
 
     test_metrics = _validated_candidate_metrics(
         metrics["test_metrics"], "test_metrics"
@@ -1511,9 +1820,6 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
     ):
         raise ValueError("experiment reports must agree on development baseline")
 
-    counts = manifest["counts"]
-    if not isinstance(counts, Mapping) or model_card["counts"] != counts:
-        raise ValueError("model manifest and model card counts must agree")
     expected_split_counts = {
         "train": len(split_indices.get("train", [])),
         "validation": len(split_indices.get("validation", [])),
@@ -1526,6 +1832,10 @@ def _validate_experiment_directory(experiment_dir: Path) -> dict[str, Any]:
         or independent_holdout.get("count") != expected_split_counts["test"]
     ):
         raise ValueError("model card compatibility counts must agree with split records")
+    _validate_error_analysis_semantics(
+        error_analysis,
+        expected_split_counts["test"],
+    )
     if (
         model_card["data_source"] != manifest["provenance"]
         or feature_config["category_options"] != model_card["category_options"]
@@ -1585,14 +1895,16 @@ def _rename_directory(source: str | Path, target: str | Path) -> Path:
 def _protected_publication_paths() -> set[Path]:
     backend_root = DEFAULT_MODELS_DIR.resolve().parent
     project_root = backend_root.parent
-    protected = {
+    protected_roots = {
         Path.home().resolve(),
         backend_root,
         project_root,
         Path.cwd().resolve(),
     }
-    protected.update(project_root.parents)
-    protected.update(Path.cwd().resolve().parents)
+    protected = set()
+    for root in protected_roots:
+        protected.add(root)
+        protected.update(root.parents)
     return protected
 
 
@@ -1641,12 +1953,24 @@ def _validate_publication_target(
 ) -> None:
     requested = Path(requested_formal_dir)
     lexical = requested.absolute()
-    if requested.exists() and lexical != formal_dir:
+    if os.path.lexists(requested) and lexical != formal_dir:
         raise ValueError("formal model directory must not be a symlink or junction")
     if formal_dir in _protected_publication_paths():
         raise ValueError("formal model directory resolves to a protected broad path")
     if formal_dir.exists() and not formal_dir.is_dir():
         raise ValueError("formal model target exists as a file, not a directory")
+
+
+def _resolve_publication_target(requested_formal_dir: str | Path) -> Path:
+    requested = Path(requested_formal_dir)
+    if os.path.lexists(requested):
+        try:
+            return requested.resolve(strict=True)
+        except (FileNotFoundError, OSError, RuntimeError) as exc:
+            raise ValueError(
+                "formal model target must not be a dangling link or junction"
+            ) from exc
+    return requested.resolve(strict=False)
 
 
 def _validate_formal_ownership(formal_dir: Path) -> None:
@@ -1676,21 +2000,131 @@ def _write_ownership_sentinel(directory: Path) -> Path:
     )
 
 
+def _publication_lock_path(formal_dir: Path) -> Path:
+    return formal_dir.with_name(f".{formal_dir.name}.publish.lock")
+
+
+def _validate_publication_lock_path(lock_dir: Path, formal_dir: Path) -> None:
+    if lock_dir != _publication_lock_path(formal_dir) or lock_dir.parent != formal_dir.parent:
+        raise ValueError("refusing publication lock operation outside exact lock path")
+
+
+def _lock_payload(
+    lock: PublicationLock,
+    state: str,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    if state not in {"active", "completed", "failed"}:
+        raise ValueError("publication lock state is invalid")
+    payload = {
+        "artifact_version": ARTIFACT_VERSION,
+        "state": state,
+        "token": lock.token,
+        "owner": lock.owner,
+        "formal_dir": str(lock.formal_dir),
+        "acquired_at": lock.acquired_at,
+        "updated_at": _utc_now().isoformat(),
+    }
+    if error is not None:
+        payload["error_type"] = type(error).__name__
+        payload["message"] = str(error)
+    return payload
+
+
+def _mark_publication_lock(
+    lock: PublicationLock,
+    state: str,
+    error: BaseException | None = None,
+) -> Path:
+    _validate_publication_lock_path(lock.path, lock.formal_dir)
+    return _write_json(
+        lock.path / PUBLICATION_LOCK_FILENAME,
+        _lock_payload(lock, state, error),
+    )
+
+
+def _recover_terminal_publication_lock(lock_dir: Path, formal_dir: Path) -> bool:
+    _validate_publication_lock_path(lock_dir, formal_dir)
+    lexical = lock_dir.absolute()
+    try:
+        resolved = lock_dir.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return False
+    if lexical != resolved or not lock_dir.is_dir():
+        return False
+    metadata_path = lock_dir / PUBLICATION_LOCK_FILENAME
+    if metadata_path.is_symlink():
+        return False
+    try:
+        metadata = _read_json(metadata_path)
+    except (OSError, TypeError, ValueError):
+        return False
+    if metadata.get("state") not in {"completed", "failed"}:
+        return False
+    shutil.rmtree(lock_dir)
+    return True
+
+
+def _acquire_publication_lock(formal_dir: Path) -> PublicationLock:
+    lock_dir = _publication_lock_path(formal_dir)
+    _validate_publication_lock_path(lock_dir, formal_dir)
+    for attempt in range(2):
+        try:
+            lock_dir.mkdir()
+        except FileExistsError:
+            if attempt == 0 and _recover_terminal_publication_lock(
+                lock_dir, formal_dir
+            ):
+                continue
+            raise FileExistsError(
+                f"another publication owns the model directory lock: {lock_dir}"
+            ) from None
+
+        acquired_at = _utc_now().isoformat()
+        lock = PublicationLock(
+            path=lock_dir,
+            formal_dir=formal_dir,
+            token=uuid.uuid4().hex,
+            owner={"pid": os.getpid(), "thread_id": threading.get_ident()},
+            acquired_at=acquired_at,
+        )
+        try:
+            _mark_publication_lock(lock, "active")
+        except Exception:
+            shutil.rmtree(lock_dir, ignore_errors=True)
+            raise
+        return lock
+    raise RuntimeError("publication lock acquisition retry was exhausted")
+
+
+def _release_publication_lock(lock: PublicationLock) -> None:
+    _validate_publication_lock_path(lock.path, lock.formal_dir)
+    shutil.rmtree(lock.path)
+
+
 @contextmanager
 def _publication_lock(formal_dir: Path):
-    lock_dir = formal_dir.with_name(f".{formal_dir.name}.publish.lock")
+    lock = _acquire_publication_lock(formal_dir)
     try:
-        lock_dir.mkdir()
-    except FileExistsError:
-        raise FileExistsError(
-            f"another publication owns the model directory lock: {lock_dir}"
-        ) from None
-    try:
-        yield
-    finally:
+        yield lock
+    except BaseException as exc:
         try:
-            lock_dir.rmdir()
-        except FileNotFoundError:
+            _mark_publication_lock(lock, "failed", exc)
+        except OSError:
+            pass
+        try:
+            _release_publication_lock(lock)
+        except OSError:
+            pass
+        raise
+    else:
+        try:
+            _mark_publication_lock(lock, "completed")
+        except OSError:
+            pass
+        try:
+            _release_publication_lock(lock)
+        except OSError:
             pass
 
 
@@ -1710,15 +2144,10 @@ def _remove_generated_publication_tree(
     shutil.rmtree(path)
 
 
-def publish_experiment(
-    experiment_dir: str | Path,
-    formal_dir: str | Path,
-) -> bool:
-    """Publish a passing experiment copy with backup and rollback."""
-    requested_formal_dir = formal_dir
-    experiment_dir = Path(experiment_dir).resolve(strict=True)
-    formal_dir = Path(formal_dir).resolve(strict=False)
-    _validate_publication_target(requested_formal_dir, formal_dir)
+def _validate_publication_relationship(
+    experiment_dir: Path,
+    formal_dir: Path,
+) -> None:
     if (
         experiment_dir == formal_dir
         or experiment_dir.is_relative_to(formal_dir)
@@ -1727,6 +2156,67 @@ def publish_experiment(
         raise ValueError(
             "experiment and formal model directories must not be equal, ancestor, or descendant"
         )
+
+
+def _write_published_run_status(
+    experiment_dir: Path,
+    staging_dir: Path,
+    manifest: Mapping[str, Any],
+) -> Path:
+    source_status = {}
+    source_status_path = experiment_dir / RUN_STATUS_FILENAME
+    if source_status_path.is_file():
+        try:
+            source_status = _read_json(source_status_path)
+        except (OSError, TypeError, ValueError):
+            source_status = {}
+    model_version = str(manifest["model_version"])
+    run_id = str(source_status.get("run_id") or model_version.removeprefix("v3-"))
+    started_at = str(
+        source_status.get("started_at")
+        or manifest.get("created_at")
+        or _utc_now().isoformat()
+    )
+    return _write_run_status(
+        staging_dir,
+        run_id,
+        started_at,
+        "publish_experiment",
+        "completed",
+        published=True,
+        quality_gate="pass",
+    )
+
+
+def _write_publication_warning(
+    experiment_dir: Path,
+    backup_dir: Path,
+    exc: OSError,
+) -> Path:
+    return _write_json(
+        experiment_dir / PUBLICATION_WARNING_FILENAME,
+        {
+            "artifact_version": ARTIFACT_VERSION,
+            "stage": "publish_experiment",
+            "warning_type": "backup_cleanup_failed",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "backup_name": backup_dir.name,
+            "timestamp": _utc_now().isoformat(),
+        },
+    )
+
+
+def publish_experiment(
+    experiment_dir: str | Path,
+    formal_dir: str | Path,
+) -> bool:
+    """Publish a passing experiment copy with backup and rollback."""
+    requested_formal_dir = formal_dir
+    experiment_dir = Path(experiment_dir).resolve(strict=True)
+    formal_dir = _resolve_publication_target(formal_dir)
+    _validate_publication_target(requested_formal_dir, formal_dir)
+    _validate_publication_relationship(experiment_dir, formal_dir)
     metrics = _read_json(experiment_dir / "metrics.json")
     if metrics.get("quality_gate") != "pass":
         return False
@@ -1740,10 +2230,15 @@ def publish_experiment(
     if verified_gate["quality_gate"] != "pass":
         return False
 
-    _validate_experiment_directory(experiment_dir)
+    payloads = _validate_experiment_directory(experiment_dir)
     _validate_formal_ownership(formal_dir)
     formal_dir.parent.mkdir(parents=True, exist_ok=True)
     with _publication_lock(formal_dir):
+        current_formal_dir = _resolve_publication_target(requested_formal_dir)
+        _validate_publication_target(requested_formal_dir, current_formal_dir)
+        if current_formal_dir != formal_dir:
+            raise ValueError("formal model target changed after publication lock")
+        _validate_publication_relationship(experiment_dir, current_formal_dir)
         _validate_formal_ownership(formal_dir)
         token = uuid.uuid4().hex
         staging_dir = formal_dir.with_name(f".{formal_dir.name}.staging-{token}")
@@ -1755,7 +2250,22 @@ def publish_experiment(
         try:
             shutil.copytree(experiment_dir, staging_dir)
             _write_ownership_sentinel(staging_dir)
-            _validate_experiment_directory(staging_dir)
+            _write_published_run_status(
+                experiment_dir,
+                staging_dir,
+                payloads["model_manifest.json"],
+            )
+            staged_payloads = _validate_experiment_directory(staging_dir)
+            staged_metrics = staged_payloads["metrics.json"]
+            staged_gate = assess_quality_gate(
+                staged_metrics["test_metrics"],
+                staged_metrics["thresholds"],
+            )
+            if (
+                staged_metrics["quality_gate"] != "pass"
+                or staged_gate["quality_gate"] != "pass"
+            ):
+                raise ValueError("staged experiment must retain a passing quality gate")
             if formal_dir.exists():
                 _rename_directory(formal_dir, backup_dir)
                 backup_created = True
@@ -1779,10 +2289,13 @@ def publish_experiment(
                     formal_dir,
                     "backup",
                 )
-            except OSError:
+            except OSError as exc:
                 # The formal swap is complete. Keep the backup recoverable rather
                 # than report a false publication failure.
-                pass
+                try:
+                    _write_publication_warning(experiment_dir, backup_dir, exc)
+                except OSError:
+                    pass
     return True
 
 

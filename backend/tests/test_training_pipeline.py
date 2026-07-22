@@ -127,10 +127,12 @@ def make_fixture_experiment():
         "split_manifest": {
             "split_version": "3.0.0",
             "seed": 42,
+            "n_splits": 2,
             "development": list(range(8)),
             "test": list(range(8, 12)),
             "folds": [
-                {"fold": 0, "train": [0, 1, 2, 3], "validation": [4, 5, 6, 7]}
+                {"fold": 0, "train": [0, 1, 2, 3], "validation": [4, 5, 6, 7]},
+                {"fold": 1, "train": [4, 5, 6, 7], "validation": [0, 1, 2, 3]},
             ],
         },
         "leaderboard": [winner],
@@ -367,6 +369,183 @@ class TrainingPipelineTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "quality gate|gate"):
                 validate_experiment(output_dir)
+
+    def test_experiment_validation_rejects_coordinated_semantic_corruption(self):
+        validate_experiment = self.require_function("_validate_experiment_directory")
+
+        def mutate_both_split_reports(payloads, mutate):
+            for report_name in ("model_manifest.json", "metrics.json"):
+                mutate(payloads[report_name])
+
+        def overlap_outer_split(payloads):
+            def mutate(report):
+                report["split_manifest"]["test"][0] = 0
+                report["split_indices"]["test"][0] = 0
+
+            mutate_both_split_reports(payloads, mutate)
+
+        def corrupt_features(payloads):
+            feature = payloads["feature_config.json"]
+            feature["target_col"] = "sale_price"
+            feature["feature_cols"] = list(reversed(feature["feature_cols"]))
+            feature["numeric_features"] = ["mileage", "bogus_numeric"]
+            feature["categorical_features"] = ["bogus_category"]
+
+        def corrupt_subgroup_sources(payloads):
+            for analysis in (
+                payloads["error_analysis.json"],
+                payloads["model_card.json"]["error_analysis"],
+            ):
+                analysis["price_quartiles"]["definition_source"] = "recorded_test"
+                analysis["price_quartiles"]["boundary_source"] = "recorded_test"
+                analysis["model_family_frequency"]["frequency_source"] = "recorded_test"
+                analysis["full_model_seen_status"]["seen_set_source"] = "recorded_test"
+
+        def mismatch_collection_year(payloads):
+            for report_name in (
+                "feature_config.json",
+                "metrics.json",
+                "leaderboard.json",
+                "model_card.json",
+            ):
+                payloads[report_name]["collection_year"] = 2025
+
+        def mismatch_seed(payloads):
+            for report_name in (
+                "metrics.json",
+                "leaderboard.json",
+                "model_card.json",
+            ):
+                payloads[report_name]["seed"] = 99
+
+        def corrupt_fold(payloads):
+            def mutate(report):
+                report["split_manifest"]["folds"][0]["train"].append(4)
+                report["split_indices"]["folds"][0]["train"].append(4)
+
+            mutate_both_split_reports(payloads, mutate)
+
+        def corrupt_refit(payloads):
+            shortened = list(range(7))
+            manifest = payloads["model_manifest.json"]
+            metrics = payloads["metrics.json"]
+            card = payloads["model_card.json"]
+            manifest["refit_strategy"]["train_indices"] = shortened
+            manifest["split_indices"]["train"] = shortened
+            metrics["split_indices"]["train"] = shortened
+            card["refit_strategy"]["train_indices"] = shortened
+            card["split"]["train"] = len(shortened)
+
+        def corrupt_split_row_identity(payloads):
+            def mutate(report):
+                report["split_manifest"]["development"][0] = 100
+                report["split_indices"]["development"][0] = 100
+                for fold in report["split_manifest"]["folds"]:
+                    for role in ("train", "validation"):
+                        fold[role] = [
+                            100 if row_id == 0 else row_id
+                            for row_id in fold[role]
+                        ]
+                report["split_indices"]["folds"] = report["split_manifest"][
+                    "folds"
+                ]
+                report["split_indices"]["train"] = [
+                    100 if row_id == 0 else row_id
+                    for row_id in report["split_indices"]["train"]
+                ]
+
+            mutate_both_split_reports(payloads, mutate)
+            manifest = payloads["model_manifest.json"]
+            manifest["refit_strategy"]["train_indices"] = manifest[
+                "split_indices"
+            ]["train"]
+            card = payloads["model_card.json"]
+            card["refit_strategy"] = manifest["refit_strategy"]
+
+        def corrupt_refit_family_strategy(payloads):
+            train_ids = list(range(6))
+            validation_ids = [6, 7]
+            for report_name in ("model_manifest.json", "metrics.json"):
+                report = payloads[report_name]
+                report["split_indices"]["train"] = train_ids
+                report["split_indices"]["validation"] = validation_ids
+            refit = payloads["model_manifest.json"]["refit_strategy"]
+            refit.update(
+                strategy="deterministic_development_holdback",
+                train_indices=train_ids,
+                validation_indices=validation_ids,
+            )
+            card = payloads["model_card.json"]
+            card["refit_strategy"] = refit
+            card["split"].update(train=len(train_ids), validation=len(validation_ids))
+            payloads["metrics.json"]["split"].update(
+                train=len(train_ids), validation=len(validation_ids)
+            )
+
+        def corrupt_ranked_winner(payloads):
+            worse = candidate_result("worse-tree")
+            worse["cv"].update(
+                acc_10_mean=0.50,
+                median_ape_mean=0.20,
+                r2_mean=0.10,
+                rmse_mean=50_000.0,
+            )
+            leaderboard = payloads["leaderboard.json"]
+            leaderboard["candidates"].append(worse)
+            leaderboard["candidate_count"] = 2
+            leaderboard["winner"] = worse["name"]
+            manifest = payloads["model_manifest.json"]
+            manifest["winner"] = worse
+            manifest["counts"]["candidates"] = 2
+            metrics = payloads["metrics.json"]
+            metrics["winner"] = worse["name"]
+            card = payloads["model_card.json"]
+            card["winner"] = worse
+            card["counts"]["candidates"] = 2
+            card["cv_selection"].update(
+                winner=worse["name"],
+                winner_cv=worse["cv"],
+                candidate_count=2,
+            )
+
+        def corrupt_target_transform(payloads):
+            manifest = payloads["model_manifest.json"]
+            manifest["target_transform"] = "identity"
+            manifest["model_artifact_metadata"]["target_transform"] = "identity"
+            payloads["feature_config.json"]["target_transform"] = "identity"
+            payloads["model_card.json"]["target_transform"] = "identity"
+
+        corruptions = {
+            "overlapping development and test": overlap_outer_split,
+            "bogus feature contract": corrupt_features,
+            "test-derived subgroup sources": corrupt_subgroup_sources,
+            "mismatched collection years": mismatch_collection_year,
+            "mismatched seeds": mismatch_seed,
+            "invalid fold": corrupt_fold,
+            "invalid refit": corrupt_refit,
+            "noncanonical split row identity": corrupt_split_row_identity,
+            "model-family refit strategy": corrupt_refit_family_strategy,
+            "coordinated wrong CV winner": corrupt_ranked_winner,
+            "noncanonical target transform": corrupt_target_transform,
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory) / "experiment"
+                train_model.build_artifacts(make_fixture_experiment(), output_dir)
+                payloads = {
+                    name: json.loads(
+                        (output_dir / name).read_text(encoding="utf-8")
+                    )
+                    for name in train_model.REQUIRED_REPORTS
+                }
+                corrupt(payloads)
+                for name, payload in payloads.items():
+                    (output_dir / name).write_text(
+                        json.dumps(payload, allow_nan=False), encoding="utf-8"
+                    )
+
+                with self.assertRaises((TypeError, ValueError)):
+                    validate_experiment(output_dir)
 
     def test_builtin_smoke_loader_rejects_unusable_family_artifacts(self):
         load_saved = self.require_function("_load_saved_model_for_smoke")
@@ -945,6 +1124,12 @@ class TrainingPipelineTests(unittest.TestCase):
                     candidates=(object(),),
                     provenance={"sha256": "fixture-sha"},
                 )
+                retained_status = json.loads(
+                    (experiment_dir / "run_status.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(retained_status["status"], "completed")
+                self.assertEqual(retained_status["stage"], "complete")
+                self.assertTrue(retained_status["published"])
 
         self.assertEqual(
             events,
@@ -1292,6 +1477,65 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertEqual(list(root.glob(".models.staging-*")), [])
             self.assertEqual(list(root.glob(".models.backup-*")), [])
 
+    def test_publication_rechecks_gate_on_staged_copy_before_formal_swap(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            formal = root / "models"
+            formal.mkdir()
+            marker = formal / "marker.bin"
+            marker.write_bytes(b"formal-before")
+            mark_owned_model_directory(formal)
+            write_publishable_experiment(experiment)
+            real_copytree = train_model.shutil.copytree
+
+            def copy_then_replace_gate(source, target, *args, **kwargs):
+                result = real_copytree(source, target, *args, **kwargs)
+                metrics_path = Path(target) / "metrics.json"
+                card_path = Path(target) / "model_card.json"
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                card = json.loads(card_path.read_text(encoding="utf-8"))
+                failed_metrics = dict(metrics["test_metrics"])
+                failed_metrics.update(r2=-0.1, acc_10=0.1, rmse=30.0)
+                failed_gate = train_model.assess_quality_gate(failed_metrics)
+                metrics.update(
+                    test_metrics=failed_metrics,
+                    quality_gate=failed_gate["quality_gate"],
+                    warnings=failed_gate["warnings"],
+                    thresholds=failed_gate["thresholds"],
+                )
+                card.update(
+                    test_metrics=failed_metrics,
+                    quality_gate=failed_gate["quality_gate"],
+                    warnings=failed_gate["warnings"],
+                    thresholds=failed_gate["thresholds"],
+                )
+                card["independent_holdout"].update(
+                    metrics=failed_metrics,
+                    quality_gate=failed_gate,
+                )
+                metrics_path.write_text(
+                    json.dumps(metrics, allow_nan=False), encoding="utf-8"
+                )
+                card_path.write_text(
+                    json.dumps(card, allow_nan=False), encoding="utf-8"
+                )
+                return result
+
+            with patch.object(
+                train_model.shutil,
+                "copytree",
+                side_effect=copy_then_replace_gate,
+            ):
+                with self.assertRaisesRegex(ValueError, "gate|passing"):
+                    publish_experiment(experiment, formal)
+
+            self.assertEqual(marker.read_bytes(), b"formal-before")
+            self.assertEqual(list(root.glob(".models.staging-*")), [])
+            self.assertEqual(list(root.glob(".models.backup-*")), [])
+            self.assertFalse((root / ".models.publish.lock").exists())
+
     def test_publication_rejects_protected_and_broad_targets_before_mutation(self):
         publish_experiment = self.require_function("publish_experiment")
         source_path = Path(train_model.__file__).resolve()
@@ -1345,6 +1589,96 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertEqual(list(root.glob(".uploads.backup-*")), [])
             self.assertFalse((root / ".uploads.publish.lock").exists())
 
+    def test_protected_paths_include_real_home_and_root_ancestors(self):
+        protected_paths = self.require_function("_protected_publication_paths")()
+        home = Path.home().resolve()
+        source_path = Path(train_model.__file__).resolve()
+        backend_root = source_path.parents[1]
+        project_root = source_path.parents[2]
+
+        for path in {
+            home,
+            *home.parents,
+            backend_root,
+            *backend_root.parents,
+            project_root,
+            *project_root.parents,
+            Path(project_root.anchor).resolve(),
+        }:
+            with self.subTest(path=path):
+                self.assertIn(path, protected_paths)
+
+    def test_simulated_users_directory_cannot_be_authorized_by_sentinel(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            simulated_home = root / "Users" / "person"
+            simulated_home.mkdir(parents=True)
+            users_dir = simulated_home.parent
+            profile = users_dir / "profile.bin"
+            profile_bytes = bytes(range(128))
+            profile.write_bytes(profile_bytes)
+            mark_owned_model_directory(users_dir)
+            experiment = root / "experiment"
+            write_publishable_experiment(experiment)
+
+            with (
+                patch.object(train_model.Path, "home", return_value=simulated_home),
+                patch.object(train_model.shutil, "copytree") as copytree,
+                patch.object(train_model, "_rename_directory") as rename,
+                patch.object(train_model.shutil, "rmtree") as rmtree,
+            ):
+                with self.assertRaisesRegex(ValueError, "protected"):
+                    publish_experiment(experiment, users_dir)
+
+            copytree.assert_not_called()
+            rename.assert_not_called()
+            rmtree.assert_not_called()
+            self.assertEqual(profile.read_bytes(), profile_bytes)
+
+    def test_publication_rejects_dangling_directory_link_before_mutation(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            target = root / "removed-target"
+            link = root / "dangling-models"
+            target.mkdir()
+            write_publishable_experiment(experiment)
+            try:
+                os.symlink(target, link, target_is_directory=True)
+            except OSError as exc:
+                if os.name != "nt":
+                    self.skipTest(f"directory links are unavailable: {exc}")
+                junction = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if junction.returncode != 0:
+                    self.skipTest(
+                        f"directory links are unavailable: {junction.stderr or exc}"
+                    )
+            target.rmdir()
+            self.assertTrue(os.path.lexists(link))
+            self.assertFalse(link.exists())
+
+            try:
+                with (
+                    patch.object(train_model.shutil, "copytree") as copytree,
+                    patch.object(train_model, "_rename_directory") as rename,
+                    patch.object(train_model.shutil, "rmtree") as rmtree,
+                ):
+                    with self.assertRaisesRegex(ValueError, "dangling|link|junction"):
+                        publish_experiment(experiment, link)
+                copytree.assert_not_called()
+                rename.assert_not_called()
+                rmtree.assert_not_called()
+            finally:
+                if os.path.lexists(link):
+                    os.rmdir(link)
+
     def test_publication_rejects_symlink_resolving_to_protected_directory(self):
         publish_experiment = self.require_function("publish_experiment")
         backend_root = Path(train_model.__file__).resolve().parents[1]
@@ -1397,10 +1731,43 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertTrue(publish_experiment(first, formal))
             sentinel = formal / ".model-publication-owner.json"
             self.assertTrue(sentinel.is_file())
+            formal_status = json.loads(
+                (formal / "run_status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(formal_status["status"], "completed")
+            self.assertTrue(formal_status["published"])
             self.assertTrue(publish_experiment(second, formal))
             self.assertTrue(sentinel.is_file())
             self.assertEqual(list(root.glob(".models.staging-*")), [])
             self.assertEqual(list(root.glob(".models.backup-*")), [])
+            self.assertFalse((root / ".models.publish.lock").exists())
+
+    def test_publication_reresolves_target_after_lock_before_mutation(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = root / "experiment"
+            formal = root / "models"
+            protected = Path(train_model.__file__).resolve().parents[1]
+            write_publishable_experiment(experiment)
+
+            with (
+                patch.object(
+                    train_model,
+                    "_resolve_publication_target",
+                    side_effect=[formal.resolve(), protected],
+                ) as resolve_target,
+                patch.object(
+                    train_model.shutil,
+                    "copytree",
+                    side_effect=self.fail,
+                ) as copytree,
+            ):
+                with self.assertRaisesRegex(ValueError, "protected|changed"):
+                    publish_experiment(experiment, formal)
+
+            self.assertEqual(resolve_target.call_count, 2)
+            copytree.assert_not_called()
             self.assertFalse((root / ".models.publish.lock").exists())
 
     def test_publication_rejects_file_target_before_mutation(self):
@@ -1471,6 +1838,82 @@ class TrainingPipelineTests(unittest.TestCase):
             self.assertEqual(list(root.glob(".models.backup-*")), [])
             self.assertFalse((root / ".models.publish.lock").exists())
 
+    def test_completed_lock_release_failure_is_recovered_by_next_publication(self):
+        publish_experiment = self.require_function("publish_experiment")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            formal = root / "models"
+            lock_dir = root / ".models.publish.lock"
+            write_publishable_experiment(first)
+            write_publishable_experiment(second)
+            real_rmtree = train_model.shutil.rmtree
+
+            def fail_lock_release(path, *args, **kwargs):
+                if Path(path) == lock_dir:
+                    raise PermissionError("simulated lock release failure")
+                return real_rmtree(path, *args, **kwargs)
+
+            with patch.object(
+                train_model.shutil,
+                "rmtree",
+                side_effect=fail_lock_release,
+            ):
+                published = publish_experiment(first, formal)
+
+            self.assertTrue(published)
+            self.assertTrue((formal / "winner.bin").is_file())
+            self.assertTrue(lock_dir.is_dir())
+            lock_metadata = json.loads(
+                (lock_dir / "lock.json").read_text(encoding="utf-8"),
+                parse_constant=lambda value: self.fail(
+                    f"non-strict lock JSON constant: {value}"
+                ),
+            )
+            self.assertEqual(lock_metadata["state"], "completed")
+            self.assertTrue(lock_metadata["owner"])
+            self.assertTrue(lock_metadata["acquired_at"])
+            self.assertTrue(lock_metadata["updated_at"])
+
+            (formal / "first-marker.bin").write_bytes(b"first")
+            self.assertTrue(publish_experiment(second, formal))
+            self.assertFalse((formal / "first-marker.bin").exists())
+            self.assertFalse(lock_dir.exists())
+
+    def test_failed_terminal_lock_is_recovered_without_masking_original_error(self):
+        publication_lock = self.require_function("_publication_lock")
+        acquire_lock = self.require_function("_acquire_publication_lock")
+        mark_lock = self.require_function("_mark_publication_lock")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            formal = root / "models"
+            real_mark_lock = train_model._mark_publication_lock
+
+            def fail_failed_state(lock, state, error=None):
+                if state == "failed":
+                    raise PermissionError("cannot update failed lock state")
+                return real_mark_lock(lock, state, error)
+
+            with patch.object(
+                train_model,
+                "_mark_publication_lock",
+                side_effect=fail_failed_state,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "original publication error"):
+                    with publication_lock(formal):
+                        raise RuntimeError("original publication error")
+
+            self.assertFalse((root / ".models.publish.lock").exists())
+
+            stale_lock = acquire_lock(formal)
+            mark_lock(stale_lock, "failed", RuntimeError("recorded failure"))
+            recovered_lock = acquire_lock(formal)
+            self.assertNotEqual(recovered_lock.token, stale_lock.token)
+            train_model._mark_publication_lock(recovered_lock, "completed")
+            train_model._release_publication_lock(recovered_lock)
+            self.assertFalse((root / ".models.publish.lock").exists())
+
     def test_post_swap_backup_cleanup_failure_keeps_success_and_recovery_copy(self):
         publish_experiment = self.require_function("publish_experiment")
         with tempfile.TemporaryDirectory() as directory:
@@ -1504,6 +1947,15 @@ class TrainingPipelineTests(unittest.TestCase):
                 (backups[0] / "old-marker.bin").read_bytes(),
                 b"recoverable-old-model",
             )
+            warning = json.loads(
+                (second / "publication_warning.json").read_text(encoding="utf-8"),
+                parse_constant=lambda value: self.fail(
+                    f"non-strict warning JSON constant: {value}"
+                ),
+            )
+            self.assertEqual(warning["warning_type"], "backup_cleanup_failed")
+            self.assertEqual(warning["error_type"], "OSError")
+            self.assertEqual(warning["backup_name"], backups[0].name)
             self.assertEqual(list(root.glob(".models.staging-*")), [])
             self.assertFalse((root / ".models.publish.lock").exists())
 
