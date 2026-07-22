@@ -143,6 +143,64 @@ class FeatureEngineeringTests(unittest.TestCase):
         self.assertTrue(pd.isna(result.loc[2, "power_per_liter"]))
         self.assertFalse(np.isinf(result["mileage_per_year"]).any())
 
+    def test_numeric_source_features_convert_infinities_to_nan(self):
+        enrich_features = self._require_callable("enrich_features")
+        source_columns = (
+            "mileage",
+            "displacement",
+            "seats",
+            "owner_count",
+            "max_power_bhp",
+            "power_rpm",
+            "max_torque_nm",
+            "torque_rpm",
+            "length_mm",
+            "width_mm",
+            "height_mm",
+            "fuel_tank_liter",
+        )
+        frame = pd.DataFrame(
+            {
+                column: [np.inf, -np.inf]
+                for column in source_columns
+            }
+        )
+
+        result = enrich_features(frame, collection_year=2026)
+
+        for column in source_columns:
+            with self.subTest(column=column):
+                self.assertTrue(result[column].isna().all())
+
+    def test_derived_features_reject_invalid_ratios_and_arithmetic_overflow(self):
+        enrich_features = self._require_callable("enrich_features")
+        frame = pd.DataFrame(
+            {
+                "year": [2020, 2020, 2020, 2020, 2020, np.inf, 2020],
+                "mileage": [60000, 60000, 60000, 60000, 60000, 1000, np.inf],
+                "displacement": [1.2, -1, 0, np.nan, np.inf, 1e-308, 1.2],
+                "max_power_bhp": [90, 90, 90, 90, 90, 1e308, 90],
+                "length_mm": [4000, 4000, 4000, 4000, 4000, 4000, 1e308],
+                "width_mm": [1700, 1700, 1700, 1700, 1700, 1700, 1e308],
+            },
+            index=[19, 2, 13, 5, 11, 3, 17],
+        )
+
+        result = enrich_features(frame, collection_year=2026)
+
+        self.assertEqual(result.loc[19, "mileage_per_year"], 10000)
+        self.assertEqual(result.loc[19, "power_per_liter"], 75)
+        self.assertEqual(result.loc[19, "footprint_m2"], 6.8)
+        for index in (2, 13, 5, 11, 3):
+            with self.subTest(index=index, feature="power_per_liter"):
+                self.assertTrue(pd.isna(result.loc[index, "power_per_liter"]))
+        self.assertTrue(pd.isna(result.loc[3, "car_age"]))
+        self.assertTrue(pd.isna(result.loc[3, "mileage_per_year"]))
+        self.assertTrue(pd.isna(result.loc[17, "mileage_per_year"]))
+        self.assertTrue(pd.isna(result.loc[17, "footprint_m2"]))
+        derived = result[["mileage_per_year", "power_per_liter", "footprint_m2"]]
+        self.assertTrue(np.isfinite(derived.stack().to_numpy(dtype=float)).all())
+
     def test_blank_missing_and_absent_categories_become_unknown(self):
         enrich_features = self._require_callable("enrich_features")
         frame = pd.DataFrame(
@@ -161,6 +219,28 @@ class FeatureEngineeringTests(unittest.TestCase):
         for column in EXPECTED_CATEGORICAL_FEATURES:
             with self.subTest(column=column):
                 self.assertEqual(result[column].tolist(), ["unknown", "unknown"])
+
+    def test_categorical_missing_values_preserve_custom_index_deterministically(self):
+        enrich_features = self._require_callable("enrich_features")
+        frame = pd.DataFrame(
+            {"model": ["Amaze S", "City ZX", "Civic V"]},
+            index=[17, 3, 11],
+        )
+        frame["brand"] = pd.Categorical(
+            ["Honda", None, "Honda"],
+            categories=["Honda"],
+        )
+
+        try:
+            first = enrich_features(frame, collection_year=2026)
+            second = enrich_features(frame, collection_year=2026)
+        except Exception as exc:
+            self.fail(f"categorical normalization raised {exc!r}")
+
+        self.assertEqual(first.index.tolist(), [17, 3, 11])
+        self.assertEqual(first["brand"].tolist(), ["Honda", "unknown", "Honda"])
+        self.assertTrue(all(isinstance(value, str) for value in first["brand"]))
+        assert_frame_equal(first, second)
 
     def test_target_transform_round_trips_vehicle_prices(self):
         transform_target = self._require_callable("transform_target")

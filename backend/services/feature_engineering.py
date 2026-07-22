@@ -36,6 +36,26 @@ CATEGORICAL_FEATURES = (
 MODEL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 
+def _finite_numeric(values: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    return numeric.replace([np.inf, -np.inf], np.nan)
+
+
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    numerator_values = numerator.to_numpy(dtype=float, na_value=np.nan)
+    denominator_values = denominator.to_numpy(dtype=float, na_value=np.nan)
+    valid = (
+        np.isfinite(numerator_values)
+        & np.isfinite(denominator_values)
+        & (denominator_values > 0)
+    )
+    result = np.full(numerator_values.shape, np.nan, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        np.divide(numerator_values, denominator_values, out=result, where=valid)
+    result[~np.isfinite(result)] = np.nan
+    return pd.Series(result, index=numerator.index)
+
+
 def enrich_features(frame: pd.DataFrame, collection_year: int) -> pd.DataFrame:
     """Return a normalized copy with all model features and derivations."""
     enriched = frame.copy()
@@ -43,34 +63,36 @@ def enrich_features(frame: pd.DataFrame, collection_year: int) -> pd.DataFrame:
     for column in NUMERIC_FEATURES:
         if column not in enriched.columns:
             enriched[column] = np.nan
-        enriched[column] = pd.to_numeric(enriched[column], errors="coerce")
+        enriched[column] = _finite_numeric(enriched[column])
 
     for column in CATEGORICAL_FEATURES:
         if column not in enriched.columns:
             enriched[column] = "unknown"
-        normalized = enriched[column].fillna("unknown").astype(str).str.strip()
+        normalized = (
+            enriched[column].astype("string").fillna("unknown").str.strip()
+        )
         enriched[column] = normalized.mask(normalized.eq(""), "unknown")
 
     enriched["model_family"] = enriched["model"].str.split().str[0]
 
     if "year" in enriched.columns:
-        year = pd.to_numeric(enriched["year"], errors="coerce")
+        year = _finite_numeric(enriched["year"])
     else:
         year = pd.Series(np.nan, index=enriched.index, dtype=float)
-    enriched["car_age"] = (collection_year - year).clip(lower=0)
+    with np.errstate(invalid="ignore", over="ignore"):
+        car_age = (collection_year - year).clip(lower=0)
+    enriched["car_age"] = _finite_numeric(car_age)
 
     age_denominator = enriched["car_age"].clip(lower=1)
-    enriched["mileage_per_year"] = (
-        enriched["mileage"] / age_denominator
-    ).replace([np.inf, -np.inf], np.nan)
-
-    displacement = enriched["displacement"].where(
-        enriched["displacement"].notna() & enriched["displacement"].ne(0)
+    enriched["mileage_per_year"] = _safe_ratio(
+        enriched["mileage"], age_denominator
     )
-    enriched["power_per_liter"] = enriched["max_power_bhp"] / displacement
-    enriched["footprint_m2"] = (
-        enriched["length_mm"] * enriched["width_mm"] / 1_000_000
+    enriched["power_per_liter"] = _safe_ratio(
+        enriched["max_power_bhp"], enriched["displacement"]
     )
+    with np.errstate(invalid="ignore", over="ignore"):
+        footprint = enriched["length_mm"] * enriched["width_mm"] / 1_000_000
+    enriched["footprint_m2"] = _finite_numeric(footprint)
 
     return enriched
 
