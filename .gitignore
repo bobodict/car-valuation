@@ -10,6 +10,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+*.db
 
 # Frontend dependencies and build output
 node_modules/

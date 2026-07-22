@@ -17,7 +17,7 @@
           <div class="pill">
             <span class="pill-dot"></span>
             <span class="pill-label-strong">模型在线</span>
-            <span>当前准确率 ≥ 92%</span>
+            <span>实验模型 · 指标可追溯</span>
           </div>
           <div class="pill">
             <span class="pill-label-strong">版本</span>
@@ -96,6 +96,10 @@
                   <div class="card-meta">
                     尽量填写真实参数，估值更准确。
                   </div>
+                </div>
+
+                <div v-if="errors.prediction" class="error-banner" role="alert">
+                  {{ errors.prediction }}
                 </div>
 
                 <form @submit.prevent="submitValuation">
@@ -233,8 +237,8 @@
                     <button type="button" class="btn-secondary" @click="resetForm">
                       重置
                     </button>
-                    <button type="submit" class="primary-btn">
-                      估算价格
+                    <button type="submit" class="primary-btn" :disabled="loading.prediction">
+                      {{ loading.prediction ? '正在估算...' : '估算价格' }}
                       <span>→</span>
                     </button>
                   </div>
@@ -259,15 +263,15 @@
                     <span class="badge-soft">
                       {{
                         valuation.lower != null
-                          ? `估值区间：${valuation.lower.toFixed(2)} - ${valuation.upper.toFixed(2)} 万`
-                          : "估值区间：—"
+                          ? `参考区间：${valuation.lower.toFixed(2)} - ${valuation.upper.toFixed(2)} 万`
+                          : "参考区间：—"
                       }}
                     </span>
-                    <span class="badge-soft-success">
+                    <span class="badge-soft-warning">
                       {{
                         valuation.confidence != null
                           ? `置信度：${valuation.confidence}`
-                          : "置信度：—"
+                          : "未校准置信度"
                       }}
                     </span>
                   </div>
@@ -292,7 +296,7 @@
               <div class="card-header">
                 <div class="card-title">
                   全局概览
-                  <span class="card-tag">样例数据</span>
+                  <span class="card-tag">真实测试指标</span>
                 </div>
 
               </div>
@@ -323,21 +327,27 @@
                 </div>
               </div>
 
-              <div class="metric-grid">
+              <div v-if="loading.metrics" class="status-banner">
+                正在加载模型测试指标...
+              </div>
+              <div v-else-if="errors.metrics" class="error-banner" role="alert">
+                {{ errors.metrics }}
+              </div>
+              <div v-else class="metric-grid">
                 <div class="metric-card">
                   <div class="metric-label">RMSE（均方根误差）</div>
-                  <div class="metric-value">{{ metrics.rmse }}</div>
-                  <div class="metric-tag">目标：越小越好</div>
+                  <div class="metric-value">{{ modelMetrics?.test_metrics?.rmse ?? '—' }}</div>
+                  <div class="metric-tag">测试集真实指标</div>
                 </div>
                 <div class="metric-card">
                   <div class="metric-label">MAE（平均绝对误差）</div>
-                  <div class="metric-value">{{ metrics.mae }}</div>
-                  <div class="metric-tag">评估整体误差水平</div>
+                  <div class="metric-value">{{ modelMetrics?.test_metrics?.mae ?? '—' }}</div>
+                  <div class="metric-tag">测试集真实指标</div>
                 </div>
                 <div class="metric-card">
                   <div class="metric-label">R²（拟合优度）</div>
-                  <div class="metric-value">{{ metrics.r2 }}</div>
-                  <div class="metric-tag">≥ 0.90 说明模型拟合较好</div>
+                  <div class="metric-value">{{ modelMetrics?.test_metrics?.r2 ?? '—' }}</div>
+                  <div class="metric-tag">不要与历史价格波动混淆</div>
                 </div>
               </div>
             </div>
@@ -375,7 +385,14 @@
                 </button>
               </div>
 
-              <div class="table-wrapper">
+              <div v-if="loading.history" class="status-banner">
+                正在加载历史记录...
+              </div>
+              <div v-else-if="errors.history" class="error-banner" role="alert">
+                {{ errors.history }}
+              </div>
+
+              <div v-else class="table-wrapper">
                 <table>
                   <thead>
                     <tr>
@@ -390,7 +407,7 @@
                   <tbody>
                     <tr
                       v-for="(record, idx) in filteredHistory"
-                      :key="idx"
+                      :key="record.id || idx"
                     >
                       <td>{{ record.time }}</td>
                       <td>{{ record.model || '-' }}</td>
@@ -423,6 +440,25 @@
                   </tbody>
                 </table>
               </div>
+
+              <div v-if="historyDetail" class="detail-panel">
+                <div class="detail-panel-header">
+                  <div class="card-title">估值详情</div>
+                  <button class="btn-secondary" @click="historyDetail = null">
+                    关闭
+                  </button>
+                </div>
+                <div class="detail-grid">
+                  <div><span>车型</span><strong>{{ historyDetail.model || '-' }}</strong></div>
+                  <div><span>城市</span><strong>{{ historyDetail.city || '-' }}</strong></div>
+                  <div><span>里程</span><strong>{{ historyDetail.mileage }} 万公里</strong></div>
+                  <div><span>上牌时间</span><strong>{{ historyDetail.year }}年{{ historyDetail.month }}月</strong></div>
+                  <div><span>变速箱</span><strong>{{ historyDetail.gearbox || '-' }}</strong></div>
+                  <div><span>排放标准</span><strong>{{ historyDetail.emission || '-' }}</strong></div>
+                  <div><span>估值</span><strong>{{ Number(historyDetail.price).toFixed(2) }} 万元</strong></div>
+                  <div><span>记录时间</span><strong>{{ historyDetail.time || '-' }}</strong></div>
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -434,7 +470,7 @@
 <script>
 import Chart from 'chart.js/auto';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000';
 
 export default {
   name: 'App',
@@ -513,12 +549,18 @@ export default {
         keyword: '',
         date: ''
       },
-      // 底部三个指标：用历史价格真实计算（标准差、平均绝对偏差、一个 0~1 评分）
-      metrics: {
-        rmse: '—',
-        mae: '—',
-        r2: '—'
+      modelMetrics: null,
+      loading: {
+        prediction: false,
+        history: false,
+        metrics: false
       },
+      errors: {
+        prediction: '',
+        history: '',
+        metrics: ''
+      },
+      historyDetail: null,
       chartPriceDist: null,
       chartTrend: null,
       chartsInit: false
@@ -562,6 +604,8 @@ switchPage(id) {
 
     // 从后端获取真实历史记录
     async fetchHistoryFromBackend() {
+      this.loading.history = true;
+      this.errors.history = '';
       try {
         const resp = await fetch(`${API_BASE}/api/history?limit=200`);
         if (!resp.ok) {
@@ -583,16 +627,42 @@ switchPage(id) {
             }
           }
           return {
+            id: r.id,
             time,
             model: r.model || '',
             city: r.city || '',
-            price: r.price ?? 0,
-            status: r.status || 'success'
+            mileage: r.mileage ?? 0,
+            year: r.year ?? '',
+            month: r.month ?? '',
+            gearbox: r.gearbox || '',
+            emission: r.emission || '',
+            price: Number(r.price ?? 0),
+            status: r.status || 'experimental'
           };
         });
 
       } catch (err) {
         console.error(err);
+        this.errors.history = '历史记录加载失败，请检查后端服务。';
+      } finally {
+        this.loading.history = false;
+      }
+    },
+
+    async fetchMetricsFromBackend() {
+      this.loading.metrics = true;
+      this.errors.metrics = '';
+      try {
+        const resp = await fetch(`${API_BASE}/api/metrics`);
+        if (!resp.ok) {
+          throw new Error(`获取模型指标失败：${resp.status}`);
+        }
+        this.modelMetrics = await resp.json();
+      } catch (err) {
+        console.error(err);
+        this.errors.metrics = '模型测试指标加载失败，请检查后端服务。';
+      } finally {
+        this.loading.metrics = false;
       }
     },
 
@@ -607,7 +677,7 @@ async submitValuation() {
     this.form.mileage === '' ||
     this.form.mileage === null
   ) {
-    alert('请完整填写带“必填”标记的字段：品牌、上牌时间、里程、所在城市。');
+    this.errors.prediction = '请完整填写品牌、上牌时间、里程和所在城市。';
     return;
   }
 
@@ -626,6 +696,8 @@ async submitValuation() {
     emission: this.form.emission
   };
 
+  this.loading.prediction = true;
+  this.errors.prediction = '';
   try {
     const resp = await fetch(`${API_BASE}/api/predict`, {
       method: 'POST',
@@ -663,7 +735,9 @@ async submitValuation() {
     });
   } catch (err) {
     console.error(err);
-    alert('调用后端估值接口失败：' + (err.message || '未知错误'));
+    this.errors.prediction = err.message || '调用后端估值接口失败。';
+  } finally {
+    this.loading.prediction = false;
   }
 },
 
@@ -685,6 +759,7 @@ async submitValuation() {
       this.valuation.confidence = null;
       this.valuation.comment =
         '提示：当前为模型预测结果，仅供参考，请结合实际车况与市场情况综合判断。';
+      this.errors.prediction = '';
     },
 
     resetHistoryFilters() {
@@ -693,11 +768,7 @@ async submitValuation() {
     },
 
     showHistoryDetail(record) {
-      alert(
-        `可以在这里扩展详情弹窗：\n\n车型：${record.model}\n城市：${record.city}\n价格：${record.price.toFixed(
-          2
-        )} 万元`
-      );
+      this.historyDetail = record;
     },
 
     // 初始化图表（第一次进入数据看板时调用）
@@ -726,7 +797,6 @@ async submitValuation() {
           this.chartTrend.data.datasets[0].data = [];
           this.chartTrend.update();
         }
-        this.metrics = { rmse: '—', mae: '—', r2: '—' };
         return;
       }
 
@@ -844,31 +914,13 @@ async submitValuation() {
         }
       }
 
-      // 3）底部指标：根据历史价格计算
-      const n = prices.length;
-      const mean =
-        prices.reduce((acc, v) => acc + v, 0) / (n || 1);
-
-      const mae =
-        prices.reduce((acc, v) => acc + Math.abs(v - mean), 0) / (n || 1);
-
-      const variance =
-        prices.reduce((acc, v) => acc + (v - mean) * (v - mean), 0) /
-        (n || 1);
-      const std = Math.sqrt(variance);
-
-      // 构造一个 0~1 的“拟合度”评分
-      const r2approx = 1 - variance / (variance + mean * mean + 1e-6);
-
-      this.metrics.rmse = std.toFixed(2);
-      this.metrics.mae = mae.toFixed(2);
-      this.metrics.r2 = r2approx.toFixed(2);
     }
   },
 
   mounted() {
     // 页面加载时先把历史记录拉一遍，进入“数据看板”时就能直接用真实数据画图
     this.fetchHistoryFromBackend();
+    this.fetchMetricsFromBackend();
   }
 };
 </script>
@@ -1449,6 +1501,13 @@ body {
   box-shadow: 0 8px 20px rgba(37, 99, 235, 0.65);
 }
 
+.primary-btn:disabled {
+  cursor: wait;
+  opacity: 0.65;
+  transform: none;
+  box-shadow: none;
+}
+
 .btn-secondary {
   border-radius: 999px;
   padding: 7px 12px;
@@ -1512,6 +1571,35 @@ body {
   border-color: rgba(34, 197, 94, 0.8);
   color: #bbf7d0;
   background: rgba(21, 128, 61, 0.22);
+}
+
+.badge-soft-warning {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, 0.8);
+  color: #fde68a;
+  background: rgba(146, 64, 14, 0.22);
+}
+
+.status-banner,
+.error-banner {
+  margin-top: 8px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.status-banner {
+  color: #cbd5e1;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  background: rgba(30, 64, 175, 0.16);
+}
+
+.error-banner {
+  color: #fecaca;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  background: rgba(127, 29, 29, 0.24);
 }
 
 /* 图表区域 */
@@ -1600,6 +1688,48 @@ body {
   border: 1px solid rgba(55, 65, 81, 0.95);
   overflow: hidden;
   background: rgba(15, 23, 42, 0.98);
+}
+
+.detail-panel {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  background: rgba(15, 23, 42, 0.92);
+}
+
+.detail-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.detail-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.78);
+}
+
+.detail-grid span {
+  color: var(--text-subtle);
+  font-size: 11px;
+}
+
+.detail-grid strong {
+  color: #e5e7eb;
+  font-size: 12px;
+  font-weight: 500;
 }
 
 table {
@@ -1706,6 +1836,10 @@ tbody tr:hover {
     grid-template-columns: minmax(0, 1fr);
   }
   .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .detail-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

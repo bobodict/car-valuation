@@ -1,28 +1,17 @@
 # database.py
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from dotenv import load_dotenv
-import os
+from config import settings
 
-# 加载 .env 文件
-load_dotenv()
 
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_NAME = os.getenv("DB_NAME")
+DATABASE_URL = settings.database_url
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
-# 构建数据库 URL（MariaDB / MySQL 通用）
-DATABASE_URL = (
-    f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
-)
-
-# 创建数据库引擎
 engine = create_engine(
     DATABASE_URL,
-    echo=False,          # 想看 SQL 日志就改成 True
-    pool_pre_ping=True  # 防止连接长时间不用被服务器断开
+    echo=False,
+    pool_pre_ping=not DATABASE_URL.startswith("sqlite"),
+    connect_args=connect_args,
 )
 
 # 会话工厂

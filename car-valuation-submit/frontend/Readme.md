@@ -1,22 +1,16 @@
-运行说明：
+# Frontend
 
-一、后端（FastAPI）
+Vue 3 + Vite client for the used-car valuation service.
 
-1. 创建并激活虚拟环境（略）
-2. 安装依赖：
-   pip install -r backend/requirements.txt
-3. 启动服务：
-   cd backend
-   uvicorn main:app --reload
+## Run locally
 
-二、前端（Vite + Vue）
+```powershell
+cd frontend
+npm install
+Copy-Item .env.example .env
+npm run dev
+```
 
-1. 安装依赖：
-   cd frontend
-   npm install
-2. 启动开发服务器：
-   npm run dev
+The API base URL is read from `VITE_API_BASE` and defaults to `http://127.0.0.1:8000`.
 
-默认访问地址：
-- 前端页面：http://localhost:5173
-- 后端接口文档：http://127.0.0.1:8000/docs
+`npm run build` creates the production bundle in `dist`.

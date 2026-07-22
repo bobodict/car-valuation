@@ -1,15 +1,19 @@
-# predict_service.py
-import os
+"""Load the supplied regression artifact and run one deterministic prediction."""
+
+from datetime import date
 import json
-import pandas as pd
+
 import joblib
+import pandas as pd
 import torch
 from torch import nn
 
-MODELS_DIR = "models"
-PREPROCESS_PATH = os.path.join(MODELS_DIR, "preprocess.joblib")
-FEATURE_CONFIG_PATH = os.path.join(MODELS_DIR, "feature_config.json")
-MODEL_PATH = os.path.join(MODELS_DIR, "price_mlp.pt")
+from config import settings
+
+MODELS_DIR = settings.models_dir
+PREPROCESS_PATH = settings.preprocess_path
+FEATURE_CONFIG_PATH = settings.feature_config_path
+MODEL_PATH = settings.model_path
 
 # 读特征配置
 with open(FEATURE_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -63,10 +67,10 @@ def predict_price_one(car_dict: dict) -> float:
         if "collection_time" in df.columns and "year" in df.columns:
             df["collection_time"] = pd.to_datetime(df["collection_time"], errors="coerce")
             df["car_age"] = (
-                df["collection_time"].dt.year.fillna(2025) - df["year"]
+                df["collection_time"].dt.year.fillna(date.today().year) - df["year"]
             ).clip(lower=0)
         elif "year" in df.columns:
-            df["car_age"] = 2025 - df["year"]
+            df["car_age"] = date.today().year - df["year"]
 
     X = df.reindex(columns=FEATURE_COLS)
     X_proc = preprocess.transform(X)
@@ -81,19 +85,19 @@ def predict_price_one(car_dict: dict) -> float:
 
 if __name__ == "__main__":
     example = {
-        "brand": "Toyota",
-        "model": "Camry",
+        "brand": "丰田",
+        "model": "凯美瑞",
         "year": 2018,
         "mileage": 60000,
-        "city": "HK",
-        "transmission": "AT",
-        "fuel_type": "Petrol",
+        "city": "广州",
+        "transmission": "自动",
+        "fuel_type": "汽油",
         "displacement": 2.0,
-        "vehicle_type": "Sedan",
-        "color": "White",
+        "vehicle_type": "轿车",
+        "color": "白色",
         "seats": 5,
-        "accident_history": "No",
+        "accident_history": "无事故",
         "owner_count": 1,
-        "collection_time": "2024-01-01",
+        "collection_time": "2026-01-01",
     }
     print("预测价格：", predict_price_one(example))

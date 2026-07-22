@@ -1,74 +1,61 @@
-# services/model_service.py
-from datetime import datetime
-from schemas import PredictRequest
-from predict_service import predict_price_one
-
+import math
 
 from schemas import PredictRequest
 from predict_service import predict_price_one
+from services.metrics_service import load_metrics
 
-def call_model_api(req: PredictRequest) -> dict:
-    """
-    调用队友训练好的神经网络模型，返回价格和区间等信息。
-    """
 
-    # 1. 前端的“变速箱”字段 -> 模型里的 transmission
-    if "自" in (req.gearbox or ""):
-        transmission = "AT"      # 自动档
-    elif "手" in (req.gearbox or ""):
-        transmission = "MT"      # 手动档
-    else:
-        transmission = "AT"      # 默认自动
+class ModelServiceError(RuntimeError):
+    """Raised when the supplied model cannot produce a usable prediction."""
 
-    # 2. 里程单位转换
-    # 前端是“万公里”，模型训练用的是“公里”
-    mileage_km = float(req.mileage) * 10000
 
-    # 3. 组装成模型需要的特征字典
-    #    key 要和你刚才发的 predict_service.py 里说明的一致
-    car_dict = {
+def _normalize_gearbox(value: str) -> str:
+    return {"自动": "自动", "手动": "手动", "其他": "自动"}.get(value, "自动")
+
+
+def build_model_input(req: PredictRequest) -> dict:
+    """Translate public Chinese UI fields into the fitted model's feature schema."""
+    return {
         "brand": req.brand,
         "model": req.model or f"{req.brand}车型",
         "year": req.year,
-        "mileage": mileage_km,
+        "mileage": float(req.mileage) * 10000,
         "city": req.city,
-        "transmission": transmission,
-        "fuel_type": "Petrol",          # 默认汽油
-        "displacement": 2.0,            # 默认 2.0 排量
-        "vehicle_type": "Sedan",        # 默认轿车
-        "color": "White",
+        "transmission": _normalize_gearbox(req.gearbox),
+        "fuel_type": "汽油",
+        "displacement": 2.0,
+        "vehicle_type": "轿车",
+        "color": "白色",
         "seats": 5,
-        "accident_history": "No",       # 默认无重大事故
+        "accident_history": "无事故",
         "owner_count": 1,
-        # "collection_time" 可以不传，predict_service 里会用 2025 - year 算 car_age
     }
 
+
+def call_model_api(req: PredictRequest) -> dict:
+    model_input = build_model_input(req)
     try:
-        # 4. 调用你队友的模型
-        raw_price = float(predict_price_one(car_dict))
+        raw_price = float(predict_price_one(model_input))
+        metrics = load_metrics()
+    except Exception as exc:
+        raise ModelServiceError("模型服务暂时不可用，请检查模型文件和运行环境。") from exc
 
-        # 你刚才跑脚本得到的是 55742.34 这种数量级，
-        # 十有八九是“元”，前端界面展示的是“万元”，这里 /10000
-        price_wan = round(raw_price / 10000, 2)
+    if not math.isfinite(raw_price) or raw_price <= 0:
+        raise ModelServiceError("模型返回了无效价格，无法生成估值结果。")
 
-        return {
-            "price": price_wan,
-            "lower": round(price_wan * 0.92, 2),
-            "upper": round(price_wan * 1.08, 2),
-            "confidence": 0.9,  # 0~1 之间的小数，前端显示“约 90%”
-            "comment": "已接入队友训练的神经网络模型预测结果，仅供参考。"
-        }
+    price_wan = round(raw_price / 10000, 2)
+    reference_low = round(price_wan * 0.92, 2)
+    reference_high = round(price_wan * 1.08, 2)
+    r2 = metrics["test_metrics"]["r2"]
 
-    except Exception as e:
-        # 任何错误都打印出来，并回退到一个简单规则，防止接口直接 500 掉
-        print("调用神经网络模型失败：", e)
-
-        base = max(3.0, 20 - 0.8 * (2025 - req.year) - 0.3 * float(req.mileage))
-        base = round(base, 2)
-        return {
-            "price": base,
-            "lower": round(base * 0.92, 2),
-            "upper": round(base * 1.08, 2),
-            "confidence": 0.6,
-            "comment": "模型调用异常，已回退到规则估值结果。"
-        }
+    return {
+        "price": price_wan,
+        "range": {"low": reference_low, "high": reference_high},
+        "confidence": None,
+        "model_status": "experimental",
+        "metrics": metrics["test_metrics"],
+        "comment": (
+            f"实验模型预测结果，仅供研究演示。当前测试集 R²={r2:.3f}；"
+            "区间为临时参考范围，不是统计置信区间。"
+        ),
+    }

@@ -1,21 +1,26 @@
-一、环境准备
+# Backend
 
-1. 创建并激活虚拟环境（示例）：
-   python -m venv venv
-   venv\Scripts\activate   （Windows）
+FastAPI service for the used-car valuation application.
 
-2. 安装依赖：
-   pip install -r requirements.txt
+## Run locally
 
-二、启动后端服务
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+uvicorn main:app --reload
+```
 
-1. 进入 backend 目录：
-   cd backend
+When no database variables are configured, the service uses a local SQLite file at `backend/car_valuation.db`. For MariaDB, fill in `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` in `.env`.
 
-2. 启动 FastAPI 服务：
-   uvicorn main:app --reload
+Swagger is available at `http://127.0.0.1:8000/docs`.
 
-默认地址：
-- 接口文档（Swagger）：http://127.0.0.1:8000/docs
-- 预测接口：POST /api/predict
-- 历史记录接口：GET /api/history
+## API
+
+- `POST /api/predict`: validates vehicle fields and returns a price in万元, a provisional reference range, real artifact metrics, and `model_status=experimental`.
+- `GET /api/history?limit=20`: returns up to 200 recent records.
+- `GET /api/metrics`: returns the test metrics stored in `models/metrics.json`.
+
+The supplied model is experimental. It has no calibrated confidence interval, and the project does not claim production accuracy. The training dataset and original training script are not part of this delivery yet.
