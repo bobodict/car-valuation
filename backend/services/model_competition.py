@@ -3,6 +3,7 @@
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from types import MappingProxyType
 from typing import Any
 
@@ -20,15 +21,24 @@ CATBOOST_MAX_ITERATIONS = 1500
 CATBOOST_EARLY_STOPPING_PATIENCE = 80
 MLP_MAX_EPOCHS = 400
 MLP_EARLY_STOPPING_PATIENCE = 40
-_FLOAT_BOUNDARY_ATOL = np.finfo(float).eps * 8
 
 
 def _freeze_value(value):
     if isinstance(value, Mapping):
         return _immutable_mapping(value)
+    if isinstance(value, np.ndarray):
+        return _freeze_value(value.tolist())
+    if isinstance(value, np.generic):
+        return _freeze_value(value.item())
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_value(item) for item in value)
-    return value
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if value is None or type(value) in (bool, int, float, str, bytes):
+        return value
+    raise TypeError(f"unsupported config value type: {type(value).__name__}")
 
 
 def _immutable_mapping(values: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -111,13 +121,19 @@ class CandidateConfig:
         object.__setattr__(self, "params", _immutable_mapping(self.params))
 
 
-def _at_or_below(values, limit: float):
-    return np.less_equal(values, limit) | np.isclose(
-        values,
-        limit,
-        rtol=0.0,
-        atol=_FLOAT_BOUNDARY_ATOL,
+def _relative_accuracy_hits(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    nonzero_actual = actual != 0
+    ratio = np.zeros_like(predicted, dtype=float)
+    np.divide(predicted, actual, out=ratio, where=nonzero_actual)
+    hits = (ratio >= 1.0 - threshold) & (ratio <= 1.0 + threshold)
+    hits[~nonzero_actual] = (
+        np.abs(predicted[~nonzero_actual]) / 1e-8 <= threshold
     )
+    return hits
 
 
 def calculate_metrics(
@@ -135,8 +151,12 @@ def calculate_metrics(
         "rmse": float(mean_squared_error(actual, predicted) ** 0.5),
         "mae": float(mean_absolute_error(actual, predicted)),
         "r2": float(r2_score(actual, predicted)),
-        "acc_10": float(np.mean(_at_or_below(relative_error, 0.10))),
-        "acc_20": float(np.mean(_at_or_below(relative_error, 0.20))),
+        "acc_10": float(
+            np.mean(_relative_accuracy_hits(actual, predicted, 0.10))
+        ),
+        "acc_20": float(
+            np.mean(_relative_accuracy_hits(actual, predicted, 0.20))
+        ),
         "median_ape": float(np.median(relative_error)),
         "rmsle": float(mean_squared_log_error(actual, predicted) ** 0.5),
         "baseline_rmse": float(mean_squared_error(actual, baseline) ** 0.5),
@@ -165,14 +185,15 @@ def _metadata_sort_key(result: dict) -> tuple[str, str]:
 
 
 def rank_candidates(results: list[dict]) -> dict:
-    best_acc_10 = max(result["cv"]["acc_10_mean"] for result in results)
+    decimal_scores = [
+        Decimal(str(result["cv"]["acc_10_mean"])) for result in results
+    ]
+    best_acc_10 = max(decimal_scores)
+    tie_window = Decimal(str(ACC_10_TIE_WINDOW))
     tied = [
         result
-        for result in results
-        if _at_or_below(
-            best_acc_10 - result["cv"]["acc_10_mean"],
-            ACC_10_TIE_WINDOW,
-        )
+        for result, score in zip(results, decimal_scores)
+        if best_acc_10 - score <= tie_window
     ]
     return min(
         tied,

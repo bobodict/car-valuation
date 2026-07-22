@@ -1,8 +1,10 @@
 import unittest
+import warnings
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 
 import numpy as np
+from sklearn.exceptions import UndefinedMetricWarning
 
 from services import model_competition
 from services.model_competition import (
@@ -54,21 +56,33 @@ class ModelCompetitionTests(unittest.TestCase):
         )
         self.assertAlmostEqual(metrics["rmsle"], expected_rmsle)
 
-    def test_acc_10_counts_mathematically_exact_threshold_errors(self):
-        actual = np.array([100.0, 200.0])
-        predicted = actual * np.array([1.1, 1.10001])
+    def test_acc_10_distinguishes_exact_threshold_from_decimal_outside(self):
+        actual = np.array([100.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UndefinedMetricWarning)
+            exact = calculate_metrics(actual, actual * 1.1, actual)
+            outside = calculate_metrics(
+                actual,
+                actual * 1.100000000000001,
+                actual,
+            )
 
-        metrics = calculate_metrics(actual, predicted, actual)
+        self.assertEqual(exact["acc_10"], 1.0)
+        self.assertEqual(outside["acc_10"], 0.0)
 
-        self.assertEqual(metrics["acc_10"], 0.5)
+    def test_acc_20_distinguishes_exact_threshold_from_decimal_outside(self):
+        actual = np.array([100.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UndefinedMetricWarning)
+            exact = calculate_metrics(actual, actual * 1.2, actual)
+            outside = calculate_metrics(
+                actual,
+                actual * 1.200000000000001,
+                actual,
+            )
 
-    def test_acc_20_counts_mathematically_exact_threshold_errors(self):
-        actual = np.array([7.0, 43.0])
-        predicted = actual * np.array([1.2, 1.20001])
-
-        metrics = calculate_metrics(actual, predicted, actual)
-
-        self.assertEqual(metrics["acc_20"], 0.5)
+        self.assertEqual(exact["acc_20"], 1.0)
+        self.assertEqual(outside["acc_20"], 0.0)
 
     def test_candidate_config_and_search_spaces_are_exact_and_bounded(self):
         config = CandidateConfig(
@@ -228,6 +242,54 @@ class ModelCompetitionTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             config.params = {}
 
+    def test_candidate_config_freezes_arrays_sets_and_bytearrays(self):
+        hidden_dims = np.array([[128, 64], [32, 16]])
+        labels = {"stable", "cpu"}
+        signature = bytearray(b"v1")
+        source = {
+            "nested": {
+                "hidden_dims": hidden_dims,
+                "labels": labels,
+                "signature": signature,
+            }
+        }
+        config = CandidateConfig(
+            name="nested-values",
+            model_type="mlp",
+            params=source,
+            complexity=2,
+        )
+
+        hidden_dims[0, 0] = 999
+        labels.add("changed")
+        signature[0] = ord("x")
+
+        nested = config.params["nested"]
+        self.assertIsInstance(nested["hidden_dims"], tuple)
+        self.assertEqual(nested["hidden_dims"], ((128, 64), (32, 16)))
+        self.assertEqual(nested["labels"], frozenset({"stable", "cpu"}))
+        self.assertEqual(nested["signature"], b"v1")
+        with self.assertRaises(TypeError):
+            nested["hidden_dims"][0][0] = 999
+        with self.assertRaises(AttributeError):
+            nested["labels"].add("changed")
+
+    def test_candidate_config_rejects_unsupported_custom_values(self):
+        class MutableCustomValue:
+            def __init__(self):
+                self.values = []
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "unsupported config value type: MutableCustomValue",
+        ):
+            CandidateConfig(
+                name="custom-value",
+                model_type="mlp",
+                params={"custom": MutableCustomValue()},
+                complexity=1,
+            )
+
     def test_candidate_sort_key_uses_cv_metrics_then_complexity(self):
         result = candidate("cat", 0.55, 0.12, 0.8, 2)
 
@@ -262,6 +324,22 @@ class ModelCompetitionTests(unittest.TestCase):
         )
 
         self.assertEqual(winner["name"], "better-relative-error")
+
+    def test_decimal_acc_10_difference_outside_point_zero_one_is_not_a_tie(self):
+        winner = rank_candidates(
+            [
+                candidate("higher-accuracy", 0.10, 0.20, 0.7, 2),
+                candidate(
+                    "better-relative-error",
+                    0.089999999999999,
+                    0.10,
+                    0.9,
+                    1,
+                ),
+            ]
+        )
+
+        self.assertEqual(winner["name"], "higher-accuracy")
 
     def test_acc_10_difference_above_point_zero_one_is_not_a_tie(self):
         winner = rank_candidates(
