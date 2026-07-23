@@ -76,6 +76,7 @@ const metrics = ref(null)
 const history = ref([])
 const historyLoading = ref(false)
 const historyError = ref('')
+const historyRequestId = ref(0)
 const prediction = ref(null)
 const predictionLoading = ref(false)
 const predictionError = ref('')
@@ -115,32 +116,39 @@ async function refreshAll() {
   }
 }
 
+async function refreshHistory() {
+  const requestId = ++historyRequestId.value
+  historyError.value = ''
+  historyLoading.value = true
+  try {
+    const nextHistory = await getHistory()
+    if (requestId === historyRequestId.value) history.value = nextHistory
+  } catch (error) {
+    if (requestId === historyRequestId.value) historyError.value = error.message || '历史记录暂时无法刷新'
+  } finally {
+    if (requestId === historyRequestId.value) historyLoading.value = false
+  }
+}
+
 async function runValuation(payload) {
   if (valuationRequestActive.value) return
   valuationRequestActive.value = true
   predictionLoading.value = true
   predictionError.value = ''
+  let result
   try {
-    const result = await predictVehicle(payload)
-    prediction.value = result
-    lastValuationInput.value = { ...payload }
-    valuationEditing.value = false
-    predictionLoading.value = false
-    historyError.value = ''
-    historyLoading.value = true
-    try {
-      history.value = await getHistory()
-    } catch (error) {
-      historyError.value = error.message || '历史记录暂时无法刷新'
-    } finally {
-      historyLoading.value = false
-    }
+    result = await predictVehicle(payload)
   } catch (error) {
     predictionError.value = error.message || '估值请求失败，请检查后端服务'
+    return
   } finally {
     predictionLoading.value = false
     valuationRequestActive.value = false
   }
+  prediction.value = result
+  lastValuationInput.value = { ...payload }
+  valuationEditing.value = false
+  await refreshHistory()
 }
 
 function editValuation() {
