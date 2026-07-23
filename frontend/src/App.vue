@@ -48,7 +48,7 @@
                 <span class="disclosure-copy"><strong>查看估值依据</strong><span>模型指标、数据来源和适用边界</span></span>
                 <span class="disclosure-mark" aria-hidden="true">+</span>
               </summary>
-              <div class="evidence-disclosure-body"><ModelEvidence :card="modelCard" :metrics="metrics" /></div>
+              <div class="evidence-disclosure-body"><ModelEvidence :card="modelCard" :metrics="evidenceMetrics" /></div>
             </details>
           </div>
         </section>
@@ -106,6 +106,7 @@ const pageMeta = {
   assistant: { title: '估值解释助手', description: '询问数据、模型或估值过程，回答基于本地知识和同一估值模型。' },
 }
 const activeMeta = computed(() => pageMeta[activeView.value])
+const evidenceMetrics = computed(() => prediction.value?.metrics ?? null)
 
 async function refreshAll() {
   initialLoading.value = true

@@ -23,6 +23,10 @@ const estimatePanelSource = readFileSync(
   new URL('./components/EstimatePanel.vue', import.meta.url),
   'utf8',
 )
+const modelEvidenceSource = readFileSync(
+  new URL('./components/ModelEvidence.vue', import.meta.url),
+  'utf8',
+)
 const appSource = readFileSync(
   new URL('./App.vue', import.meta.url),
   'utf8',
@@ -385,7 +389,45 @@ test('renders a missing result range through safe optional access', () => {
   assert.doesNotMatch(estimatePanelSource, /result\.range\.(?:low|high)/)
 })
 
+test('guards empty and experimental estimate result states', () => {
+  assert.match(estimatePanelSource, /const hasResult = computed/)
+  assert.match(estimatePanelSource, /<header v-if="hasResult" class="result-heading">/)
+  assert.match(estimatePanelSource, /const qualityGatePassed = computed/)
+  assert.match(estimatePanelSource, /:class="qualityGatePassed \? 'result-pass' : 'result-fail'"/)
+  assert.match(estimatePanelSource, /v-if="!qualityGatePassed" class="gate-alert" role="status"/)
+})
+
+test('only labels a complete finite estimate range as a reference range', () => {
+  assert.match(estimatePanelSource, /const hasReferenceRange = computed/)
+  assert.match(estimatePanelSource, /Number\.isFinite\(range\?\.low\)/)
+  assert.match(estimatePanelSource, /Number\.isFinite\(range\?\.high\)/)
+  assert.match(estimatePanelSource, /v-else>参考区间暂缺<\/strong>/)
+  assert.match(estimatePanelSource, /v-if="hasReferenceRange" class="range-note">±8% 参考区间/)
+})
+
+test('keeps result identity fields readable through explicit fallbacks', () => {
+  for (const name of ['displayPrice', 'displayCurrency', 'displayUnit', 'displayComment', 'displayModelVersion']) {
+    assert.match(estimatePanelSource, new RegExp(`const ${name} = computed`))
+  }
+  assert.match(estimatePanelSource, />模型版本</)
+  assert.doesNotMatch(estimatePanelSource, /可信度|confidence percentage/i)
+})
+
 test('keeps valuation evidence progressive and scoped to the result view', () => {
   assert.ok(appSource.includes("import ModelEvidence from './components/ModelEvidence.vue'"))
-  assert.match(appSource, /<details class="evidence-disclosure">[\s\S]*查看估值依据[\s\S]*模型指标、数据来源和适用边界[\s\S]*disclosure-mark[\s\S]*\+[\s\S]*<ModelEvidence :card="modelCard" :metrics="metrics" \/>/)
+  assert.match(appSource, /<details class="evidence-disclosure">[\s\S]*查看估值依据[\s\S]*模型指标、数据来源和适用边界[\s\S]*disclosure-mark[\s\S]*\+[\s\S]*<ModelEvidence :card="modelCard" :metrics="evidenceMetrics" \/>/)
+  assert.match(appSource, /const evidenceMetrics = computed\(\(\) => prediction\.value\?\.metrics \?\? null\)/)
+  assert.doesNotMatch(appSource, /<ModelEvidence[^>]*:metrics="metrics"/)
+})
+
+test('does not fabricate an error comparison chart from missing evidence', () => {
+  assert.match(modelEvidenceSource, /const testMetrics = computed\(\(\) => props\.metrics\?\.test_metrics \?\? props\.metrics \?\? \{\}\)/)
+  assert.match(modelEvidenceSource, /const hasCompleteErrorMetrics = computed/)
+  assert.ok(modelEvidenceSource.includes('暂无完整误差对比数据。'))
+  assert.doesNotMatch(modelEvidenceSource, /\|\| 0/)
+  assert.doesNotMatch(modelEvidenceSource, /props\.card\?\.test_metrics/)
+
+  const destroyIndex = modelEvidenceSource.indexOf('chart?.destroy()')
+  const guardIndex = modelEvidenceSource.indexOf('if (!chartCanvas.value')
+  assert.ok(destroyIndex >= 0 && destroyIndex < guardIndex, 'chart must be destroyed before evidence guards return')
 })
