@@ -46,6 +46,7 @@ from services.split_service import build_split_manifest
 
 
 SEED = 42
+DEFAULT_COLLECTION_YEAR = 2026
 ARTIFACT_VERSION = "3.0.0"
 MODEL_CONTRACT_VERSION = "3.0.0"
 FEATURE_VERSION = "3.0.0"
@@ -2819,7 +2820,9 @@ def main() -> None:
         "--experiments-dir", type=Path, default=DEFAULT_EXPERIMENTS_DIR
     )
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--collection-year", type=int, required=True)
+    parser.add_argument(
+        "--collection-year", type=int, default=DEFAULT_COLLECTION_YEAR
+    )
     parser.add_argument("--download", action="store_true")
     args = parser.parse_args()
 

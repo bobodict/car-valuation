@@ -2386,6 +2386,36 @@ class TrainingPipelineTests(unittest.TestCase):
         source = Path(train_model.__file__).read_text(encoding="utf-8")
         self.assertNotIn("--allow-failed-publish", source)
 
+    def test_download_cli_uses_fixed_v3_collection_year_by_default(self):
+        dataset = Path("normalized.csv")
+        provenance = {"source_id": "fixture"}
+        result = {"published": True}
+
+        with (
+            patch("sys.argv", ["train_model.py", "--download"]),
+            patch.object(
+                train_model,
+                "_prepare_downloaded_dataset",
+                return_value=(dataset, provenance),
+            ),
+            patch.object(
+                train_model,
+                "train_and_publish",
+                return_value=result,
+            ) as publish,
+            patch("builtins.print"),
+        ):
+            train_model.main()
+
+        publish.assert_called_once_with(
+            dataset,
+            models_dir=train_model.DEFAULT_MODELS_DIR,
+            experiments_dir=train_model.DEFAULT_EXPERIMENTS_DIR,
+            seed=train_model.SEED,
+            collection_year=train_model.DEFAULT_COLLECTION_YEAR,
+            provenance=provenance,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
