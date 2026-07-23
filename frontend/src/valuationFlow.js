@@ -11,21 +11,40 @@ const requiredLabels = {
   emission: '排放标准', accident_history: '事故历史',
 }
 
-function isNumberInRange(value, minimum, maximum, integer = false) {
-  if (value === '' || value === null || value === undefined) return false
+function isNonblankText(value) {
+  return typeof value === 'string' && Boolean(value.trim())
+}
+
+function toFiniteNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value !== 'string' || !value.trim()) return null
 
   const number = Number(value)
-  return Number.isFinite(number)
+  return Number.isFinite(number) ? number : null
+}
+
+function isNumberInRange(value, minimum, maximum, integer = false) {
+  const number = toFiniteNumber(value)
+  return number !== null
     && (!integer || Number.isInteger(number))
     && number >= minimum
     && number <= maximum
+}
+
+function displayText(value, fallback = '--') {
+  return isNonblankText(value) ? value.trim() : fallback
+}
+
+function displayNumber(value) {
+  const number = toFiniteNumber(value)
+  return number === null ? '--' : String(number)
 }
 
 export function validateValuationStep(form, stepIndex, currentYear = new Date().getFullYear()) {
   const fields = VALUATION_STEPS[stepIndex]?.fields || []
   const errors = {}
   const required = field => {
-    if (fields.includes(field) && !String(form[field] ?? '').trim()) {
+    if (fields.includes(field) && !isNonblankText(form[field])) {
       errors[field] = `请填写${requiredLabels[field]}`
     }
   }
@@ -42,19 +61,18 @@ export function validateValuationStep(form, stepIndex, currentYear = new Date().
 }
 
 export function getValuationSummary(form) {
-  const mileage = isNumberInRange(form.mileage, 0, Number.MAX_VALUE)
-    ? new Intl.NumberFormat('zh-CN').format(Number(form.mileage))
-    : '--'
-  const displacement = isNumberInRange(form.displacement, 0, Number.MAX_VALUE)
-    ? form.displacement
-    : '--'
+  const values = form ?? {}
+  const mileageNumber = toFiniteNumber(values.mileage)
+  const mileage = mileageNumber === null
+    ? '--'
+    : new Intl.NumberFormat('zh-CN').format(mileageNumber)
 
   return [
-    { label: '车辆', value: `${form.brand || '--'} ${form.model || '--'}`.trim() },
-    { label: '上牌时间', value: `${form.year || '--'} 年 ${form.month || '--'} 月` },
+    { label: '车辆', value: `${displayText(values.brand)} ${displayText(values.model)}` },
+    { label: '上牌时间', value: `${displayNumber(values.year)} 年 ${displayNumber(values.month)} 月` },
     { label: '行驶里程', value: `${mileage} km` },
-    { label: '城市', value: form.city || '--' },
-    { label: '配置', value: `${form.gearbox || '--'} · ${form.fuel_type || '--'} · ${displacement} L` },
-    { label: '车况', value: `${form.owner_count || '--'} 任车主 · 事故记录 ${form.accident_history || 'unknown'}` },
+    { label: '城市', value: displayText(values.city) },
+    { label: '配置', value: `${displayText(values.gearbox)} · ${displayText(values.fuel_type)} · ${displayNumber(values.displacement)} L` },
+    { label: '车况', value: `${displayNumber(values.owner_count)} 任车主 · 事故记录 ${displayText(values.accident_history, 'unknown')}` },
   ]
 }
