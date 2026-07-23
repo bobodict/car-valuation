@@ -90,14 +90,14 @@ test('accepts lower and upper numeric boundaries', () => {
   }
 })
 
-test('accepts finite numbers and nonblank numeric strings', () => {
+test('accepts finite numeric values represented as numbers', () => {
   assert.deepEqual(validateValuationStep({
     ...validForm,
-    year: '1980', month: '12', mileage: ' 0.5 ', owner_count: '20',
+    year: 1980, month: 12, mileage: 0.5, owner_count: 20,
   }, 1, 2026).errors, {})
   assert.deepEqual(validateValuationStep({
     ...validForm,
-    displacement: ' 1.198 ', seats: '20',
+    displacement: 1.198, seats: 20,
   }, 2, 2026).errors, {})
 })
 
@@ -130,6 +130,9 @@ test('rejects nonnumeric and nonscalar values instead of coercing them', () => {
     { field: 'seats', stepIndex: 2, validValue: 5 },
   ]
   const invalidValues = [
+    { label: 'decimal numeric string', create: value => String(value) },
+    { label: 'scientific numeric string', create: value => `${value}e0` },
+    { label: 'hex numeric string', create: value => `0x${Math.max(1, Math.trunc(value)).toString(16)}` },
     { label: 'empty string', create: () => '' },
     { label: 'whitespace string', create: () => '   ' },
     { label: 'nonnumeric string', create: () => 'not-a-number' },
@@ -222,9 +225,9 @@ test('builds readable result summary without changing the payload', () => {
 
 test('trims summary display values without mutating the input', () => {
   const form = {
-    brand: ' Honda ', model: ' Amaze ', year: ' 2017 ', month: ' 6 ',
-    mileage: ' 87150 ', city: ' Pune ', gearbox: ' Manual ',
-    fuel_type: ' Petrol ', displacement: ' 1.198 ', owner_count: ' 1 ',
+    brand: ' Honda ', model: ' Amaze ', year: 2017, month: 6,
+    mileage: 87150, city: ' Pune ', gearbox: ' Manual ',
+    fuel_type: ' Petrol ', displacement: 1.198, owner_count: 1,
     accident_history: ' unknown ',
   }
   const before = structuredClone(form)
@@ -281,8 +284,20 @@ test('uses numeric fallbacks for blank, nonfinite, and nonscalar summary values'
   }
 })
 
-test('preserves numeric zero from numbers and numeric strings in summaries', () => {
-  for (const value of [0, '0', ' 0 ']) {
+test('preserves numeric zero but rejects numeric strings in summaries', () => {
+  const zeroSummary = getValuationSummary({
+    year: 0,
+    month: 0,
+    mileage: 0,
+    displacement: 0,
+    owner_count: 0,
+  })
+  assert.equal(zeroSummary[1].value, '0 年 0 月')
+  assert.equal(zeroSummary[2].value, '0 km')
+  assert.equal(zeroSummary[4].value, '-- · -- · 0 L')
+  assert.equal(zeroSummary[5].value, '0 任车主 · 事故记录 unknown')
+
+  for (const value of ['0', ' 0 ', '1.198', '1e3', '0x10']) {
     const summary = getValuationSummary({
       year: value,
       month: value,
@@ -290,10 +305,10 @@ test('preserves numeric zero from numbers and numeric strings in summaries', () 
       displacement: value,
       owner_count: value,
     })
-    assert.equal(summary[1].value, '0 年 0 月')
-    assert.equal(summary[2].value, '0 km')
-    assert.equal(summary[4].value, '-- · -- · 0 L')
-    assert.equal(summary[5].value, '0 任车主 · 事故记录 unknown')
+    assert.equal(summary[1].value, '-- 年 -- 月')
+    assert.equal(summary[2].value, '-- km')
+    assert.equal(summary[4].value, '-- · -- · -- L')
+    assert.equal(summary[5].value, '-- 任车主 · 事故记录 unknown')
   }
 })
 
