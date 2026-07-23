@@ -48,7 +48,13 @@
                 <span class="disclosure-copy"><strong>查看估值依据</strong><span>模型指标、数据来源和适用边界</span></span>
                 <span class="disclosure-mark" aria-hidden="true">+</span>
               </summary>
-              <div class="evidence-disclosure-body"><ModelEvidence :card="modelCard" :metrics="evidenceMetrics" /></div>
+              <div class="evidence-disclosure-body">
+                <ModelEvidence v-if="evidenceVersionMatches" :card="modelCard" :metrics="evidenceMetrics" />
+                <div v-else class="empty-evidence" role="status">
+                  <strong>估值依据暂不可用</strong>
+                  <p>当前结果与已加载的模型说明版本不一致，请重新加载页面。</p>
+                </div>
+              </div>
             </details>
           </div>
         </section>
@@ -107,6 +113,15 @@ const pageMeta = {
 }
 const activeMeta = computed(() => pageMeta[activeView.value])
 const evidenceMetrics = computed(() => prediction.value?.metrics ?? null)
+const evidenceVersionMatches = computed(() => {
+  const predictionVersion = prediction.value?.model_version
+  const cardVersion = modelCard.value?.model_version
+  return typeof predictionVersion === 'string'
+    && predictionVersion.trim().length > 0
+    && typeof cardVersion === 'string'
+    && cardVersion.trim().length > 0
+    && predictionVersion === cardVersion
+})
 
 async function refreshAll() {
   initialLoading.value = true

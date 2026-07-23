@@ -415,9 +415,17 @@ test('keeps result identity fields readable through explicit fallbacks', () => {
 
 test('keeps valuation evidence progressive and scoped to the result view', () => {
   assert.ok(appSource.includes("import ModelEvidence from './components/ModelEvidence.vue'"))
-  assert.match(appSource, /<details class="evidence-disclosure">[\s\S]*查看估值依据[\s\S]*模型指标、数据来源和适用边界[\s\S]*disclosure-mark[\s\S]*\+[\s\S]*<ModelEvidence :card="modelCard" :metrics="evidenceMetrics" \/>/)
+  assert.match(appSource, /<details class="evidence-disclosure">[\s\S]*查看估值依据[\s\S]*模型指标、数据来源和适用边界[\s\S]*disclosure-mark[\s\S]*\+[\s\S]*<ModelEvidence v-if="evidenceVersionMatches" :card="modelCard" :metrics="evidenceMetrics" \/>/)
   assert.match(appSource, /const evidenceMetrics = computed\(\(\) => prediction\.value\?\.metrics \?\? null\)/)
   assert.doesNotMatch(appSource, /<ModelEvidence[^>]*:metrics="metrics"/)
+  assert.doesNotMatch(appSource, /<details class="evidence-disclosure"[^>]*\bopen\b/)
+})
+
+test('gates result evidence on exact nonblank model versions', () => {
+  assert.match(appSource, /const evidenceVersionMatches = computed\(\(\) => \{[\s\S]*const predictionVersion = prediction\.value\?\.model_version[\s\S]*const cardVersion = modelCard\.value\?\.model_version[\s\S]*typeof predictionVersion === 'string'[\s\S]*predictionVersion\.trim\(\)\.length > 0[\s\S]*typeof cardVersion === 'string'[\s\S]*cardVersion\.trim\(\)\.length > 0[\s\S]*predictionVersion === cardVersion[\s\S]*\}\)/)
+  assert.match(appSource, /v-else class="empty-evidence" role="status"/)
+  assert.ok(appSource.includes('估值依据暂不可用'))
+  assert.ok(appSource.includes('当前结果与已加载的模型说明版本不一致，请重新加载页面。'))
 })
 
 test('does not fabricate an error comparison chart from missing evidence', () => {
