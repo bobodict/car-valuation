@@ -1777,13 +1777,18 @@ class TrainingPipelineTests(unittest.TestCase):
         source_path = Path(train_model.__file__).resolve()
         backend_root = source_path.parents[1]
         project_root = source_path.parents[2]
+        workspace_repository_root = (
+            project_root.parents[1]
+            if len(project_root.parents) > 1
+            else project_root.parent
+        )
         targets = {
             "home": Path.home().resolve(),
             "filesystem anchor": Path(project_root.anchor).resolve(),
             "backend root": backend_root,
             "project root": project_root,
             "worktree container": project_root.parent,
-            "workspace repository root": project_root.parents[1],
+            "workspace repository root": workspace_repository_root,
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
