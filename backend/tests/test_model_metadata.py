@@ -313,6 +313,8 @@ class ModelMetadataTests(unittest.TestCase):
                         side_effect=[
                             (old_identity, False),
                             (old_identity, False),
+                            (old_identity, False),
+                            (new_identity, False),
                             (new_identity, False),
                             (new_identity, False),
                         ],
@@ -330,7 +332,7 @@ class ModelMetadataTests(unittest.TestCase):
         self.assertEqual(new_metrics["model_type"], "new_type")
         self.assertEqual(new_metrics["feature_version"], "3.1.0")
         self.assertEqual(new_metrics["quality_gate"], "pass")
-        self.assertEqual(publication_state.call_count, 4)
+        self.assertEqual(publication_state.call_count, 6)
 
     def test_metrics_route_retries_a_publication_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -357,6 +359,7 @@ class ModelMetadataTests(unittest.TestCase):
                             (new_identity, False),
                             (new_identity, False),
                             (new_identity, False),
+                            (new_identity, False),
                         ],
                     ) as publication_state,
                 ):
@@ -365,7 +368,7 @@ class ModelMetadataTests(unittest.TestCase):
                 metrics_service.load_metrics.cache_clear()
 
         self.assertEqual(response.model_version, "new-v3")
-        self.assertEqual(publication_state.call_count, 4)
+        self.assertEqual(publication_state.call_count, 5)
 
     def test_v3_cross_report_mutation_is_rejected_by_metrics_and_model_card(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -404,6 +407,84 @@ class ModelMetadataTests(unittest.TestCase):
             finally:
                 metrics_service.load_metrics.cache_clear()
                 predict_service.clear_model_runtime_cache()
+
+    def test_formal_model_card_rejects_missing_required_report(self):
+        for missing_report in ("leaderboard.json", "model_card.json"):
+            with self.subTest(missing_report=missing_report):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "models"
+                    shutil.copytree(settings.models_dir, root)
+                    (root / missing_report).unlink()
+                    with patch.object(
+                        model_metadata, "settings", SimpleNamespace(models_dir=root)
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "formal v3 publication is incomplete.*"
+                            + missing_report,
+                        ):
+                            load_model_card(root / "model_card.json")
+
+    def test_metrics_retries_when_final_identity_changes_after_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.json"
+            old_artifact = make_metrics(model_version="old-v3")
+            new_artifact = make_metrics(model_version="new-v3")
+            path.write_text(json.dumps(old_artifact), encoding="utf-8")
+            old_identity = ("publication", "old")
+            new_identity = ("publication", "new")
+            calls = 0
+
+            def publication_state():
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    path.write_text(json.dumps(new_artifact), encoding="utf-8")
+                return (old_identity, False) if calls < 3 else (new_identity, False)
+
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with (
+                    patch.object(
+                        metrics_service,
+                        "settings",
+                        SimpleNamespace(metrics_path=path),
+                    ),
+                    patch.object(
+                        metrics_service,
+                        "get_model_publication_state",
+                        side_effect=publication_state,
+                    ),
+                ):
+                    result = metrics_service.load_metrics()
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        self.assertEqual(result["model_version"], "new-v3")
+        self.assertEqual(calls, 6)
+
+    def test_default_formal_model_card_rejects_final_identity_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            old_identity = ("publication", "old")
+            new_identity = ("publication", "new")
+            with (
+                patch.object(
+                    model_metadata, "settings", SimpleNamespace(models_dir=root)
+                ),
+                patch.object(
+                    model_metadata,
+                    "get_model_publication_state",
+                    create=True,
+                    side_effect=[
+                        (old_identity, False),
+                        (new_identity, False),
+                    ],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "publication changed"):
+                    load_model_card()
 
     def test_model_health_route_exhausts_publication_change_retries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -507,8 +588,10 @@ class ModelMetadataTests(unittest.TestCase):
                         side_effect=[
                             (identity, False),
                             (identity, False),
+                            (identity, False),
                             (identity, True),
                             ModelRuntimeError("publication gap persisted"),
+                            (new_identity, False),
                             (new_identity, False),
                             (new_identity, False),
                         ],

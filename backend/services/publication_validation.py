@@ -17,15 +17,8 @@ V3_REPORT_FILES = (
 )
 
 
-def validate_formal_v3_reports(root: str | Path) -> dict[str, Any] | None:
-    """Strictly validate a complete v3 report set when one is present.
-
-    Lightweight v3 runtime fixtures and legacy publications intentionally do
-    not carry the full training report set, so they retain their existing
-    compatibility behavior.
-    """
-    publication_root = Path(root)
-    manifest_path = publication_root / "model_manifest.json"
+def _load_manifest(root: Path) -> Mapping[str, Any] | None:
+    manifest_path = root / "model_manifest.json"
     try:
         with manifest_path.open("r", encoding="utf-8") as manifest_file:
             manifest = json.load(manifest_file)
@@ -36,12 +29,38 @@ def validate_formal_v3_reports(root: str | Path) -> dict[str, Any] | None:
 
     if not isinstance(manifest, Mapping):
         raise ValueError("model_manifest.json must contain a JSON object")
+    return manifest
+
+
+def is_formal_v3_manifest(root: str | Path) -> bool:
+    """Return whether a publication is marked as a formal v3 release."""
+    manifest = _load_manifest(Path(root))
+    return manifest is not None and manifest.get("artifact_version") == V3_ARTIFACT_VERSION
+
+
+def validate_formal_v3_reports(root: str | Path) -> dict[str, Any] | None:
+    """Strictly validate a complete v3 report set when one is present.
+
+    Lightweight v3 runtime fixtures and legacy publications intentionally do
+    not carry the full training report set, so they retain their existing
+    compatibility behavior.
+    """
+    publication_root = Path(root)
+    manifest = _load_manifest(publication_root)
+    if manifest is None:
+        return None
     if manifest.get("artifact_version") != V3_ARTIFACT_VERSION:
         return None
-    if not all(
-        (publication_root / filename).is_file() for filename in V3_REPORT_FILES
-    ):
-        return None
+    missing_reports = [
+        filename
+        for filename in V3_REPORT_FILES
+        if not (publication_root / filename).is_file()
+    ]
+    if missing_reports:
+        raise ValueError(
+            "formal v3 publication is incomplete; missing required reports: "
+            + ", ".join(missing_reports)
+        )
 
     # Keep the training validator out of import-time API dependencies.
     from scripts.train_model import _validate_experiment_directory

@@ -127,6 +127,14 @@ def _load_metrics_for_state(
             f"published v3 reports are invalid: {exc}"
         ) from exc
 
+    final_identity, final_is_stale = get_model_publication_state()
+    if final_identity != expected_identity:
+        raise MetricsPublicationChanged(
+            "model publication changed while metrics were validated"
+        )
+    if final_is_stale:
+        return _require_cached_metrics(expected_identity)
+
     fingerprint = hashlib.sha256(contents).digest()
     cached = _cached_snapshots.get(expected_identity)
     if cached is not None and cached[0] == fingerprint:
