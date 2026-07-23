@@ -245,7 +245,6 @@
           <input
             id="accident_history"
             v-model.trim="form.accident_history"
-            required
             placeholder="unknown"
             :aria-invalid="fieldErrors.accident_history ? 'true' : undefined"
             :aria-describedby="fieldErrors.accident_history ? 'accident_history_error' : undefined"
