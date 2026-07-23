@@ -17,8 +17,24 @@ V3_REPORT_FILES = (
 )
 
 
+def resolve_v3_report_path(root: str | Path, filename: str) -> Path:
+    """Resolve a required report path without allowing symlinks or escapes."""
+    publication_root = Path(root)
+    report_path = publication_root / filename
+    if report_path.is_symlink():
+        raise ValueError(f"formal v3 report must not be a symlink: {filename}")
+    resolved_root = publication_root.resolve(strict=True)
+    resolved_report = report_path.resolve(strict=False)
+    if (
+        resolved_report == resolved_root
+        or resolved_root not in resolved_report.parents
+    ):
+        raise ValueError(f"formal v3 report is outside publication directory: {filename}")
+    return report_path
+
+
 def _load_manifest(root: Path) -> Mapping[str, Any] | None:
-    manifest_path = root / "model_manifest.json"
+    manifest_path = resolve_v3_report_path(root, "model_manifest.json")
     try:
         with manifest_path.open("r", encoding="utf-8") as manifest_file:
             manifest = json.load(manifest_file)
@@ -51,10 +67,12 @@ def validate_formal_v3_reports(root: str | Path) -> dict[str, Any] | None:
         return None
     if manifest.get("artifact_version") != V3_ARTIFACT_VERSION:
         return None
-    missing_reports = [
-        filename
+    report_paths = {
+        filename: resolve_v3_report_path(publication_root, filename)
         for filename in V3_REPORT_FILES
-        if not (publication_root / filename).is_file()
+    }
+    missing_reports = [
+        filename for filename, report_path in report_paths.items() if not report_path.is_file()
     ]
     if missing_reports:
         raise ValueError(

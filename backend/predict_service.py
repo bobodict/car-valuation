@@ -10,7 +10,10 @@ from typing import Any, NamedTuple
 
 from config import settings
 from services.model_runtime import ModelRuntime, ModelRuntimeError
-from services.publication_validation import V3_REPORT_FILES
+from services.publication_validation import (
+    V3_REPORT_FILES,
+    resolve_v3_report_path,
+)
 
 
 _runtime_lock = threading.RLock()
@@ -28,6 +31,8 @@ class ModelPublicationState(NamedTuple):
 
 
 def _file_stat(path: Path, identity_name: str) -> tuple[Any, ...]:
+    if path.is_symlink():
+        raise ValueError(f"published file must not be a symlink: {identity_name}")
     details = path.stat()
     if not stat.S_ISREG(details.st_mode):
         raise ValueError(f"published model artifact is not a file: {identity_name}")
@@ -64,6 +69,28 @@ def _json_object(contents: bytes, label: str) -> tuple[dict[str, Any], str]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must contain a JSON object")
     return value, hashlib.sha256(contents).hexdigest()
+
+
+def _report_stats(root: Path) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    return tuple(
+        (
+            filename,
+            _file_stat(resolve_v3_report_path(root, filename), filename),
+        )
+        for filename in V3_REPORT_FILES
+    )
+
+
+def _report_digests(root: Path) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            filename,
+            hashlib.sha256(
+                resolve_v3_report_path(root, filename).read_bytes()
+            ).hexdigest(),
+        )
+        for filename in V3_REPORT_FILES
+    )
 
 
 def _artifact_paths(
@@ -119,20 +146,14 @@ def _v3_identity(
 
     report_before = None
     try:
-        report_before = tuple(
-            (filename, _file_stat(root / filename, filename))
-            for filename in V3_REPORT_FILES
-        )
+        report_before = _report_stats(root)
     except FileNotFoundError:
         if formal_v3:
             raise OSError("v3 publication report set is incomplete")
         pass
     report_digests = None
     if report_before is not None:
-        report_digests = tuple(
-            (filename, hashlib.sha256((root / filename).read_bytes()).hexdigest())
-            for filename in V3_REPORT_FILES
-        )
+        report_digests = _report_digests(root)
 
     directory_after = _directory_stat(root)
     manifest_after = _file_stat(manifest_path, "model_manifest.json")
@@ -144,14 +165,8 @@ def _v3_identity(
     report_after = None
     report_digests_after = None
     if report_before is not None:
-        report_after = tuple(
-            (filename, _file_stat(root / filename, filename))
-            for filename in V3_REPORT_FILES
-        )
-        report_digests_after = tuple(
-            (filename, hashlib.sha256((root / filename).read_bytes()).hexdigest())
-            for filename in V3_REPORT_FILES
-        )
+        report_after = _report_stats(root)
+        report_digests_after = _report_digests(root)
     if (
         directory_before != directory_after
         or manifest_before != manifest_after

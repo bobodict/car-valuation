@@ -17,7 +17,7 @@ from schemas import (
     PredictResponse,
 )
 import predict_service
-from services import metrics_service, model_metadata
+from services import metrics_service, model_metadata, publication_validation
 from services.model_metadata import load_model_card
 from services.model_quality_service import get_model_health
 from services.model_runtime import ModelRuntimeError
@@ -485,6 +485,63 @@ class ModelMetadataTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "publication changed"):
                     load_model_card()
+
+    def test_default_formal_model_card_rejects_transition_to_fixture_before_final_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            old_identity = ("publication", "old")
+            new_identity = ("publication", "fixture")
+
+            def transition_to_fixture(_root):
+                manifest_path = root / "model_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["artifact_version"] = "2.0.0"
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                return None
+
+            with (
+                patch.object(
+                    model_metadata, "settings", SimpleNamespace(models_dir=root)
+                ),
+                patch.object(
+                    model_metadata,
+                    "get_model_publication_state",
+                    create=True,
+                    side_effect=[
+                        (old_identity, False),
+                        (new_identity, False),
+                    ],
+                ),
+                patch.object(
+                    model_metadata,
+                    "validate_formal_v3_reports",
+                    side_effect=transition_to_fixture,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "publication changed"):
+                    load_model_card()
+
+    def test_formal_report_symlinks_are_rejected_by_validation_and_identity(self):
+        for filename in publication_validation.V3_REPORT_FILES:
+            with self.subTest(filename=filename):
+                with tempfile.TemporaryDirectory() as directory:
+                    parent = Path(directory)
+                    root = parent / "models"
+                    shutil.copytree(settings.models_dir, root)
+                    external = parent / f"external-{filename}"
+                    report_path = root / filename
+                    external.write_bytes(report_path.read_bytes())
+                    report_path.unlink()
+                    try:
+                        os.symlink(external, report_path)
+                    except OSError as exc:
+                        self.skipTest(f"symlink creation is unavailable: {exc}")
+
+                    with self.assertRaisesRegex(ValueError, "symlink|outside"):
+                        load_model_card(root / "model_card.json")
+                    with self.assertRaisesRegex(ValueError, "symlink|outside"):
+                        predict_service._published_artifact_identity(root)
 
     def test_model_health_route_exhausts_publication_change_retries(self):
         with tempfile.TemporaryDirectory() as directory:

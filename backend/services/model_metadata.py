@@ -52,11 +52,12 @@ def load_model_card(path: str | Path | None = None) -> dict:
         with card_path.open("r", encoding="utf-8") as card_file:
             card = json.load(card_file)
     else:
-        if expected_identity is not None:
-            final_identity, final_is_stale = get_model_publication_state()
-            if final_identity != expected_identity or final_is_stale:
-                raise ValueError("model publication changed while model card was read")
         card = formal_reports["model_card.json"]
+
+    if expected_identity is not None:
+        final_identity, final_is_stale = get_model_publication_state()
+        if final_identity != expected_identity or final_is_stale:
+            raise ValueError("model publication changed while model card was read")
 
     if not isinstance(card, dict):
         raise ValueError("model card must contain a JSON object")
