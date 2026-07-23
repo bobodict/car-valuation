@@ -62,7 +62,6 @@
           <input
             id="vehicle_type"
             v-model.trim="form.vehicle_type"
-            required
             placeholder="car"
             :aria-invalid="fieldErrors.vehicle_type ? 'true' : undefined"
             :aria-describedby="fieldErrors.vehicle_type ? 'vehicle_type_error' : undefined"
@@ -110,6 +109,7 @@
             v-model.number="form.mileage"
             type="number"
             min="0"
+            max="10000000"
             step="1"
             required
             placeholder="87150"
@@ -143,7 +143,6 @@
             min="1"
             max="20"
             step="1"
-            required
             :aria-invalid="fieldErrors.owner_count ? 'true' : undefined"
             :aria-describedby="fieldErrors.owner_count ? 'owner_count_error' : undefined"
           />
@@ -158,7 +157,6 @@
           <select
             id="gearbox"
             v-model="form.gearbox"
-            required
             :aria-invalid="fieldErrors.gearbox ? 'true' : undefined"
             :aria-describedby="fieldErrors.gearbox ? 'gearbox_error' : undefined"
           >
@@ -176,7 +174,6 @@
             v-model.trim="form.fuel_type"
             list="fuel_options"
             autocomplete="off"
-            required
             placeholder="例如 Petrol"
             :aria-invalid="fieldErrors.fuel_type ? 'true' : undefined"
             :aria-describedby="fieldErrors.fuel_type ? 'fuel_type_error' : undefined"
@@ -193,7 +190,6 @@
             min="0"
             max="10"
             step="0.001"
-            required
             :aria-invalid="fieldErrors.displacement ? 'true' : undefined"
             :aria-describedby="fieldErrors.displacement ? 'displacement_error' : undefined"
           />
@@ -209,7 +205,6 @@
             min="1"
             max="20"
             step="1"
-            required
             :aria-invalid="fieldErrors.seats ? 'true' : undefined"
             :aria-describedby="fieldErrors.seats ? 'seats_error' : undefined"
           />
@@ -223,7 +218,6 @@
             v-model.trim="form.color"
             list="color_options"
             autocomplete="off"
-            required
             placeholder="例如 Grey"
             :aria-invalid="fieldErrors.color ? 'true' : undefined"
             :aria-describedby="fieldErrors.color ? 'color_error' : undefined"
@@ -236,7 +230,6 @@
           <input
             id="emission"
             v-model.trim="form.emission"
-            required
             placeholder="unknown"
             :aria-invalid="fieldErrors.emission ? 'true' : undefined"
             :aria-describedby="fieldErrors.emission ? 'emission_error' : undefined"
@@ -275,7 +268,7 @@
       <div class="form-actions wizard-actions">
         <button v-if="activeStep > 0" type="button" class="button button-quiet" :disabled="loading" @click="previousStep">返回</button>
         <button v-if="!isFinalStep" type="button" class="button button-primary" :disabled="loading" @click="nextStep">继续</button>
-        <button v-else type="submit" class="button button-primary" :disabled="loading">{{ loading ? '正在估算' : '最终开始估值' }}</button>
+        <button v-else type="submit" class="button button-primary" :disabled="loading">{{ loading ? '正在估算' : '开始估值' }}</button>
       </div>
     </form>
 
@@ -317,8 +310,9 @@ const summary = computed(() => getValuationSummary(form))
 const isFinalStep = computed(() => activeStep.value === VALUATION_STEPS.length - 1)
 const progressPercent = computed(() => Math.round(((activeStep.value + 1) / VALUATION_STEPS.length) * 100))
 
-function clearFieldErrors() {
+function replaceErrors(errors) {
   Object.keys(fieldErrors).forEach(key => delete fieldErrors[key])
+  Object.assign(fieldErrors, errors)
 }
 
 function focusField(field) {
@@ -332,8 +326,7 @@ function focusFormTitle() {
 
 function validateCurrentStep() {
   const result = validateValuationStep(form, activeStep.value, currentYear)
-  clearFieldErrors()
-  Object.assign(fieldErrors, result.errors)
+  replaceErrors(result.errors)
   if (result.firstInvalidField) focusField(result.firstInvalidField)
   return Object.keys(result.errors).length === 0
 }
@@ -349,7 +342,7 @@ function previousStep() {
   if (props.loading) return
   if (activeStep.value === 0) return
   activeStep.value -= 1
-  clearFieldErrors()
+  replaceErrors({})
   focusFormTitle()
 }
 
@@ -366,7 +359,7 @@ function handleSubmit() {
 function resetForm() {
   Object.assign(form, defaultForm)
   activeStep.value = 0
-  clearFieldErrors()
+  replaceErrors({})
   emit('reset')
 }
 </script>

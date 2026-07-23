@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -12,6 +13,19 @@ const validForm = {
   year: 2017, month: 6, gearbox: 'Manual', emission: 'unknown',
   fuel_type: 'Petrol', displacement: 1.198, seats: 5, owner_count: 1,
   vehicle_type: 'car', color: 'Grey', accident_history: 'unknown',
+}
+
+const valuationFormSource = readFileSync(
+  new URL('./components/ValuationForm.vue', import.meta.url),
+  'utf8',
+)
+
+function controlTag(field) {
+  const match = valuationFormSource.match(
+    new RegExp(`<(?:input|select)\\b[^>]*\\bid="${field}"[^>]*>`, 's'),
+  )
+  assert.ok(match, `expected a control for ${field}`)
+  return match[0]
 }
 
 const expectedSteps = [
@@ -55,6 +69,24 @@ test('defines exact step IDs and assigns every prediction field once', () => {
   assert.equal(fields.length, 15)
   assert.deepEqual(fields, requiredPredictionFields)
   assert.equal(new Set(fields).size, fields.length)
+})
+
+test('keeps guided form controls aligned with the input contract', () => {
+  const mileage = controlTag('mileage')
+  assert.match(mileage, /min="0"/)
+  assert.match(mileage, /max="10000000"/)
+  assert.match(mileage, /step="1"/)
+
+  assert.match(valuationFormSource, /loading \? '正在估算' : '开始估值'/)
+  assert.match(valuationFormSource, /function replaceErrors\(errors\) \{[\s\S]*Object\.keys\(fieldErrors\)\.forEach[\s\S]*Object\.assign\(fieldErrors, errors\)/)
+  assert.match(valuationFormSource, /function validateCurrentStep\(\) \{[\s\S]*replaceErrors\(result\.errors\)/)
+  assert.match(valuationFormSource, /function previousStep\(\) \{[\s\S]*replaceErrors\(\{\}\)/)
+  assert.match(valuationFormSource, /function resetForm\(\) \{[\s\S]*replaceErrors\(\{\}\)/)
+
+  for (const field of ['gearbox', 'fuel_type', 'displacement', 'seats', 'owner_count', 'color', 'vehicle_type', 'emission']) {
+    assert.doesNotMatch(controlTag(field), /\brequired\b/, `${field} should keep its original optional HTML constraint`)
+  }
+  assert.match(controlTag('accident_history'), /\brequired\b/)
 })
 
 test('keeps accident history validation on the final step', () => {
