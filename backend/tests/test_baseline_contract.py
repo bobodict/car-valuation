@@ -101,21 +101,55 @@ class ModelAdapterTests(unittest.TestCase):
 
 class MetricsTests(unittest.TestCase):
     def test_artifact_metrics_are_loaded_from_backend_model_directory(self):
+        models_dir = settings.models_dir
+        manifest = json.loads(
+            (models_dir / "model_manifest.json").read_text(encoding="utf-8")
+        )
         artifact = json.loads(settings.metrics_path.read_text(encoding="utf-8"))
         feature_config = json.loads(
             settings.feature_config_path.read_text(encoding="utf-8")
+        )
+        model_card = json.loads(
+            (models_dir / "model_card.json").read_text(encoding="utf-8")
+        )
+        leaderboard = json.loads(
+            (models_dir / "leaderboard.json").read_text(encoding="utf-8")
         )
         metrics = load_metrics()
         test_metrics = metrics["test_metrics"]
 
         self.assertEqual(artifact["artifact_version"], "3.0.0")
+        self.assertEqual(manifest["artifact_version"], artifact["artifact_version"])
         self.assertEqual(artifact["model_type"], "catboost")
+        self.assertEqual(manifest["model_type"], artifact["model_type"])
+        self.assertEqual(manifest["model_artifacts"], {"model": "catboost.cbm"})
+        self.assertTrue((models_dir / "catboost.cbm").is_file())
         self.assertRegex(artifact["model_version"], r"^v3-.+")
         self.assertEqual(feature_config["feature_version"], "3.0.0")
         self.assertEqual(metrics["feature_version"], feature_config["feature_version"])
+        self.assertEqual(manifest["feature_version"], feature_config["feature_version"])
+        self.assertEqual(model_card["feature_version"], manifest["feature_version"])
         self.assertEqual(metrics["model_type"], artifact["model_type"])
         self.assertEqual(metrics["model_version"], artifact["model_version"])
+        self.assertEqual(manifest["model_version"], artifact["model_version"])
+        self.assertEqual(model_card["model_version"], manifest["model_version"])
+        self.assertEqual(leaderboard["model_version"], manifest["model_version"])
+        self.assertEqual(leaderboard["winner"], artifact["winner"])
+        self.assertEqual(manifest["winner"]["name"], leaderboard["winner"])
+        self.assertEqual(model_card["winner"], manifest["winner"])
+        self.assertEqual(leaderboard["winner_model_type"], manifest["model_type"])
+        self.assertEqual(leaderboard["selection_scope"], "development_cv_only")
+        self.assertEqual(leaderboard["selection_method"], "rank_candidates")
+        self.assertFalse(leaderboard["outer_test_metrics_in_candidates"])
         self.assertEqual(metrics["quality_gate"], "pass")
+        self.assertEqual(artifact["quality_gate"], "pass")
+        self.assertEqual(model_card["quality_gate"], artifact["quality_gate"])
+        self.assertEqual(artifact["thresholds"]["min_r2"], 0.0)
+        self.assertEqual(artifact["thresholds"]["min_acc_10"], 0.50)
+        self.assertEqual(artifact["evaluation_scope"], "recorded_test")
+        self.assertEqual(
+            model_card["independent_holdout"]["scope"], "recorded_test"
+        )
         self.assertGreater(test_metrics["r2"], 0)
         self.assertGreaterEqual(test_metrics["acc_10"], 0.50)
         self.assertLess(test_metrics["rmse"], test_metrics["baseline_rmse"])

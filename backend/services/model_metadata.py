@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from config import settings
+from services.publication_validation import validate_formal_v3_reports
 
 
 REQUIRED_KEYS = (
@@ -36,8 +37,12 @@ def _load_optional_object(path: Path) -> dict:
 
 def load_model_card(path: str | Path | None = None) -> dict:
     card_path = Path(path) if path else settings.models_dir / "model_card.json"
-    with card_path.open("r", encoding="utf-8") as card_file:
-        card = json.load(card_file)
+    formal_reports = validate_formal_v3_reports(card_path.parent)
+    if formal_reports is None:
+        with card_path.open("r", encoding="utf-8") as card_file:
+            card = json.load(card_file)
+    else:
+        card = formal_reports["model_card.json"]
 
     if not isinstance(card, dict):
         raise ValueError("model card must contain a JSON object")

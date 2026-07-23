@@ -9,6 +9,7 @@ from config import settings
 from predict_service import get_model_publication_state
 from schemas import MetricsResponse
 from services.model_runtime import ModelRuntimeError
+from services.publication_validation import validate_formal_v3_reports
 
 
 class MetricsPublicationChanged(ModelRuntimeError):
@@ -116,6 +117,15 @@ def _load_metrics_for_state(
         )
     if current_is_stale:
         return _require_cached_metrics(expected_identity)
+
+    try:
+        validate_formal_v3_reports(settings.metrics_path.parent)
+    except MemoryError:
+        raise
+    except Exception as exc:
+        raise ModelRuntimeError(
+            f"published v3 reports are invalid: {exc}"
+        ) from exc
 
     fingerprint = hashlib.sha256(contents).digest()
     cached = _cached_snapshots.get(expected_identity)

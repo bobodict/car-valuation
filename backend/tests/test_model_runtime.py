@@ -263,6 +263,19 @@ def write_cache_v3_publication(
     (root / "winner.joblib").write_bytes(artifact_bytes)
 
 
+def write_cache_v3_formal_reports(root, marker="report-v1"):
+    write_cache_v3_publication(root)
+    for filename in (
+        "metrics.json",
+        "leaderboard.json",
+        "error_analysis.json",
+        "model_card.json",
+    ):
+        (root / filename).write_text(
+            json.dumps({"marker": marker}, sort_keys=True), encoding="utf-8"
+        )
+
+
 def write_cache_legacy_publication(root, model_bytes=b"legacy-model-v1"):
     manifest_path = root / "model_manifest.json"
     if manifest_path.exists():
@@ -997,6 +1010,68 @@ class PredictServiceRuntimeTests(unittest.TestCase):
                 self.assertIs(predict_service.get_model_runtime(), second_runtime)
 
             self.assertEqual(loader.call_count, 2)
+
+    def test_formal_report_replacement_automatically_reloads_runtime(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_formal_reports(root)
+            first_runtime = Mock()
+            second_runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    side_effect=[first_runtime, second_runtime],
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), first_runtime)
+                (root / "leaderboard.json").write_text(
+                    json.dumps({"marker": "report-v2"}, sort_keys=True),
+                    encoding="utf-8",
+                )
+                self.assertIs(predict_service.get_model_runtime(), second_runtime)
+
+            self.assertEqual(loader.call_count, 2)
+
+    def test_formal_report_gap_uses_bounded_stale_runtime_fallback(self):
+        import predict_service
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_cache_v3_formal_reports(root)
+            manifest_path = root / "model_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["artifact_version"] = "3.0.0"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            runtime = Mock()
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+            )
+            predict_service.clear_model_runtime_cache()
+            with (
+                patch.object(predict_service, "settings", fake_settings),
+                patch.object(
+                    predict_service.ModelRuntime,
+                    "from_directory",
+                    return_value=runtime,
+                ) as loader,
+            ):
+                self.assertIs(predict_service.get_model_runtime(), runtime)
+                (root / "leaderboard.json").unlink()
+                self.assertIs(predict_service.get_model_runtime(), runtime)
+                with self.assertRaises(ModelRuntimeError):
+                    predict_service.get_model_runtime()
+
+            loader.assert_called_once_with(root)
 
     def test_manifest_gap_keeps_old_runtime_until_complete_identity_appears(self):
         import predict_service

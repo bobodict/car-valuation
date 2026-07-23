@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 from config import settings
 from services.model_runtime import ModelRuntime, ModelRuntimeError
+from services.publication_validation import V3_REPORT_FILES
 
 
 _runtime_lock = threading.RLock()
@@ -104,6 +105,7 @@ def _v3_identity(
     manifest, manifest_digest = _json_object(
         manifest_contents, "model_manifest.json"
     )
+    formal_v3 = manifest.get("artifact_version") == "3.0.0"
     artifact_paths = _artifact_paths(root, manifest)
     feature_path = root / "feature_config.json"
     feature_before = _file_stat(feature_path, "feature_config.json")
@@ -115,6 +117,23 @@ def _v3_identity(
     feature_contents = feature_path.read_bytes()
     _, feature_digest = _json_object(feature_contents, "feature_config.json")
 
+    report_before = None
+    try:
+        report_before = tuple(
+            (filename, _file_stat(root / filename, filename))
+            for filename in V3_REPORT_FILES
+        )
+    except FileNotFoundError:
+        if formal_v3:
+            raise OSError("v3 publication report set is incomplete")
+        pass
+    report_digests = None
+    if report_before is not None:
+        report_digests = tuple(
+            (filename, hashlib.sha256((root / filename).read_bytes()).hexdigest())
+            for filename in V3_REPORT_FILES
+        )
+
     directory_after = _directory_stat(root)
     manifest_after = _file_stat(manifest_path, "model_manifest.json")
     feature_after = _file_stat(feature_path, "feature_config.json")
@@ -122,11 +141,24 @@ def _v3_identity(
         (role, _file_stat(path, relative_name))
         for role, relative_name, path in artifact_paths
     )
+    report_after = None
+    report_digests_after = None
+    if report_before is not None:
+        report_after = tuple(
+            (filename, _file_stat(root / filename, filename))
+            for filename in V3_REPORT_FILES
+        )
+        report_digests_after = tuple(
+            (filename, hashlib.sha256((root / filename).read_bytes()).hexdigest())
+            for filename in V3_REPORT_FILES
+        )
     if (
         directory_before != directory_after
         or manifest_before != manifest_after
         or feature_before != feature_after
         or artifacts_before != artifacts_after
+        or report_before is not None and report_before != report_after
+        or report_before is not None and report_digests != report_digests_after
     ):
         raise OSError("v3 publication changed while its identity was read")
     return (
@@ -135,6 +167,12 @@ def _v3_identity(
         (manifest_after, manifest_digest),
         (feature_after, feature_digest),
         artifacts_after,
+        tuple(
+            (filename, stat_details, digest)
+            for (filename, stat_details), (_, digest) in zip(
+                report_after or (), report_digests_after or ()
+            )
+        ),
     )
 
 

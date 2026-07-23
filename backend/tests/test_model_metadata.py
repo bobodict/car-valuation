@@ -1,11 +1,13 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from config import settings
 from main import get_metrics, model_card, model_health
 from schemas import (
     MetricsResponse,
@@ -14,7 +16,8 @@ from schemas import (
     PredictRequest,
     PredictResponse,
 )
-from services import metrics_service
+import predict_service
+from services import metrics_service, model_metadata
 from services.model_metadata import load_model_card
 from services.model_quality_service import get_model_health
 from services.model_runtime import ModelRuntimeError
@@ -363,6 +366,44 @@ class ModelMetadataTests(unittest.TestCase):
 
         self.assertEqual(response.model_version, "new-v3")
         self.assertEqual(publication_state.call_count, 4)
+
+    def test_v3_cross_report_mutation_is_rejected_by_metrics_and_model_card(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            fake_settings = SimpleNamespace(
+                models_dir=root,
+                published_models_dir=root,
+                metrics_path=root / "metrics.json",
+            )
+            metrics_service.load_metrics.cache_clear()
+            predict_service.clear_model_runtime_cache()
+            try:
+                with (
+                    patch.object(metrics_service, "settings", fake_settings),
+                    patch.object(predict_service, "settings", fake_settings),
+                    patch.object(model_metadata, "settings", fake_settings),
+                ):
+                    first_metrics = metrics_service.load_metrics()
+                    self.assertTrue(first_metrics["model_version"].startswith("v3-"))
+                    self.assertEqual(model_card()["model_version"], first_metrics["model_version"])
+
+                    card_path = root / "model_card.json"
+                    card = json.loads(card_path.read_text(encoding="utf-8"))
+                    card["model_version"] = "v3-cross-report-corruption"
+                    card_path.write_text(
+                        json.dumps(card, sort_keys=True), encoding="utf-8"
+                    )
+
+                    with self.assertRaisesRegex(
+                        metrics_service.ModelRuntimeError, "reports|model_version"
+                    ):
+                        metrics_service.load_metrics()
+                    with self.assertRaisesRegex(ValueError, "reports|model_version"):
+                        model_card()
+            finally:
+                metrics_service.load_metrics.cache_clear()
+                predict_service.clear_model_runtime_cache()
 
     def test_model_health_route_exhausts_publication_change_retries(self):
         with tempfile.TemporaryDirectory() as directory:
