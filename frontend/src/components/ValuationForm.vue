@@ -366,11 +366,12 @@ async function handleSubmit() {
   else await nextStep()
 }
 
-function resetForm() {
+async function resetForm() {
   Object.assign(form, defaultForm)
   activeStep.value = 0
   replaceErrors({})
   emit('reset')
+  await focusFormTitle()
 }
 </script>
 

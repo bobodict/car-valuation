@@ -83,6 +83,7 @@ test('keeps guided form controls aligned with the input contract', () => {
   assert.match(valuationFormSource, /function validateCurrentStep\(\) \{[\s\S]*replaceErrors\(result\.errors\)/)
   assert.match(valuationFormSource, /function previousStep\(\) \{[\s\S]*replaceErrors\(\{\}\)/)
   assert.match(valuationFormSource, /function resetForm\(\) \{[\s\S]*replaceErrors\(\{\}\)/)
+  assert.match(valuationFormSource, /async function resetForm\(\) \{[\s\S]*activeStep\.value = 0[\s\S]*replaceErrors\(\{\}\)[\s\S]*emit\('reset'\)[\s\S]*await focusFormTitle\(\)/)
 
   for (const field of ['gearbox', 'fuel_type', 'displacement', 'seats', 'owner_count', 'color', 'vehicle_type', 'emission', 'accident_history']) {
     assert.doesNotMatch(controlTag(field), /\brequired\b/, `${field} should keep its original optional HTML constraint`)
