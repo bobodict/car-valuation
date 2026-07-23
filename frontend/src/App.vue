@@ -8,7 +8,7 @@
           <strong>车辆估值</strong>
         </button>
         <nav class="top-nav" aria-label="主要导航">
-          <button v-for="item in navItems" :key="item.id" class="top-nav-link" :class="{ active: activeView === item.id }" type="button" @click="activeView = item.id">{{ item.label }}</button>
+          <button v-for="item in navItems" :key="item.id" class="top-nav-link" :class="{ active: activeView === item.id }" :aria-current="activeView === item.id ? 'page' : undefined" type="button" @click="activeView = item.id">{{ item.label }}</button>
         </nav>
         <span class="service-state"><i :class="{ online: !bootError }"></i>{{ bootError ? '服务异常' : '服务在线' }}</span>
       </div>
@@ -35,17 +35,18 @@
       </div>
       <template v-else>
         <StatusStrip v-if="activeView === 'research'" :health="health" :metrics="metrics" :card="modelCard" />
-        <section v-if="activeView === 'valuation'" class="valuation-flow">
+        <section v-show="activeView === 'valuation'" class="valuation-flow">
           <div v-show="valuationEditing || !prediction" class="valuation-stage">
             <ValuationForm :card="modelCard" :loading="predictionLoading" :error="predictionError" @submit="runValuation" @reset="clearPrediction" />
           </div>
           <div v-if="prediction && !valuationEditing" class="result-stage">
+            <h1 class="sr-only">车辆估值结果</h1>
             <div v-if="historyError" class="inline-error" role="alert">{{ historyError }}</div>
             <EstimatePanel :result="prediction" :input="lastValuationInput" @edit="editValuation" />
             <button class="button button-quiet" type="button" @click="editValuation">修改车辆信息</button>
           </div>
         </section>
-        <section v-else-if="activeView === 'research'" class="view-stack"><ResearchOverview :card="modelCard" /></section>
+        <section v-if="activeView === 'research'" class="view-stack"><ResearchOverview :card="modelCard" /></section>
         <section v-else-if="activeView === 'assistant'" class="view-stack"><AssistantPanel :response="assistantResponse" :loading="assistantLoading" :error="assistantError" @submit="askQuestion" /></section>
         <section v-else-if="activeView === 'history'" class="view-stack"><HistoryLog :history="history" :loading="historyLoading" :error="historyError" /></section>
       </template>
@@ -78,6 +79,7 @@ const historyError = ref('')
 const prediction = ref(null)
 const predictionLoading = ref(false)
 const predictionError = ref('')
+const valuationRequestActive = ref(false)
 const assistantResponse = ref(null)
 const assistantLoading = ref(false)
 const assistantError = ref('')
@@ -114,6 +116,8 @@ async function refreshAll() {
 }
 
 async function runValuation(payload) {
+  if (valuationRequestActive.value) return
+  valuationRequestActive.value = true
   predictionLoading.value = true
   predictionError.value = ''
   try {
@@ -121,6 +125,7 @@ async function runValuation(payload) {
     prediction.value = result
     lastValuationInput.value = { ...payload }
     valuationEditing.value = false
+    predictionLoading.value = false
     historyError.value = ''
     historyLoading.value = true
     try {
@@ -134,6 +139,7 @@ async function runValuation(payload) {
     predictionError.value = error.message || '估值请求失败，请检查后端服务'
   } finally {
     predictionLoading.value = false
+    valuationRequestActive.value = false
   }
 }
 
