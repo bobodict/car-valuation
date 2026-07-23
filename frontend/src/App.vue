@@ -3,81 +3,52 @@
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <header class="topbar">
       <div class="topbar-inner">
-        <div class="brand-lockup">
-          <div class="brand-mark" aria-hidden="true">CV</div>
-          <div>
-            <strong>车辆估值研究控制台</strong>
-            <span>Research Console / Used-car valuation</span>
-          </div>
-        </div>
-        <div class="topbar-meta">
-          <span class="service-state"><i :class="{ online: !bootError }"></i>{{ bootError ? 'API 检查失败' : 'API 已连接' }}</span>
-          <span class="topbar-divider"></span>
-          <span>{{ modelCard?.currency || 'INR' }} / {{ modelCard?.model_version || '加载中' }}</span>
-        </div>
+        <button class="brand-lockup" type="button" aria-label="返回车辆估值" @click="activeView = 'valuation'">
+          <span class="brand-mark" aria-hidden="true">CV</span>
+          <strong>车辆估值</strong>
+        </button>
+        <nav class="top-nav" aria-label="主要导航">
+          <button v-for="item in navItems" :key="item.id" class="top-nav-link" :class="{ active: activeView === item.id }" type="button" @click="activeView = item.id">{{ item.label }}</button>
+        </nav>
+        <span class="service-state"><i :class="{ online: !bootError }"></i>{{ bootError ? '服务异常' : '服务在线' }}</span>
       </div>
     </header>
 
-    <div class="workspace">
-      <aside class="side-rail" aria-label="工作区导航">
-        <div class="rail-caption">WORKSPACE</div>
-        <nav class="rail-nav">
-          <button v-for="item in navItems" :key="item.id" class="rail-link" :class="{ active: activeView === item.id }" type="button" @click="activeView = item.id">
-            <span class="rail-number">{{ item.number }}</span>
-            <span><strong>{{ item.label }}</strong><small>{{ item.sub }}</small></span>
-          </button>
-        </nav>
-        <div class="rail-footer">
-          <span class="eyebrow">DATASET</span>
-          <strong>{{ modelCard?.data_source?.source_id || '等待数据源' }}</strong>
-          <span>{{ modelCard?.sample_count?.toLocaleString() || '--' }} rows / {{ modelCard?.price_unit || 'INR' }}</span>
+    <main id="main-content" class="main-content">
+      <div v-if="activeView !== 'valuation' || valuationEditing || !prediction" class="page-intro">
+        <div>
+          <h1>{{ activeMeta.title }}</h1>
+          <p>{{ activeMeta.description }}</p>
         </div>
-      </aside>
+        <button v-if="bootError" class="button button-quiet" type="button" @click="refreshAll">重新连接</button>
+      </div>
 
-      <main id="main-content" class="main-content">
-        <div class="page-intro">
-          <div>
-            <span class="eyebrow">{{ activeMeta.eyebrow }}</span>
-            <h1>{{ activeMeta.title }}</h1>
-            <p>{{ activeMeta.description }}</p>
+      <div v-if="initialLoading" class="console-skeleton" aria-label="页面加载中">
+        <div class="skeleton skeleton-strip"></div>
+        <div class="skeleton-grid"><div class="skeleton skeleton-block"></div><div class="skeleton skeleton-block"></div></div>
+      </div>
+      <div v-else-if="bootError" class="panel boot-error" role="alert">
+        <span class="empty-mark" aria-hidden="true">!</span>
+        <strong>暂时无法读取模型元数据</strong>
+        <p>{{ bootError }}</p>
+        <button class="button button-primary" type="button" @click="refreshAll">重试加载</button>
+      </div>
+      <template v-else>
+        <StatusStrip v-if="activeView === 'research'" :health="health" :metrics="metrics" :card="modelCard" />
+        <section v-if="activeView === 'valuation'" class="valuation-flow">
+          <div v-show="valuationEditing || !prediction" class="valuation-stage">
+            <ValuationForm :card="modelCard" :loading="predictionLoading" :error="predictionError" @submit="runValuation" @reset="clearPrediction" />
           </div>
-          <button v-if="bootError" class="button button-quiet" type="button" @click="refreshAll">重新连接</button>
-        </div>
-
-        <div v-if="initialLoading" class="console-skeleton" aria-label="控制台加载中">
-          <div class="skeleton skeleton-strip"></div>
-          <div class="skeleton-grid"><div class="skeleton skeleton-block"></div><div class="skeleton skeleton-block"></div></div>
-        </div>
-        <div v-else-if="bootError" class="panel boot-error" role="alert">
-          <span class="empty-mark" aria-hidden="true">!</span>
-          <strong>暂时无法读取模型元数据</strong>
-          <p>{{ bootError }}</p>
-          <button class="button button-primary" type="button" @click="refreshAll">重试加载</button>
-        </div>
-        <template v-else>
-          <StatusStrip :health="health" :metrics="metrics" :card="modelCard" />
-          <section v-if="activeView === 'research'" class="view-stack">
-            <ResearchOverview :card="modelCard" />
-          </section>
-          <section v-else-if="activeView === 'valuation'" class="view-stack">
-            <div class="content-grid">
-              <ValuationForm :card="modelCard" :loading="predictionLoading" :error="predictionError" @submit="runValuation" @reset="clearPrediction" />
-              <EstimatePanel :result="prediction" :loading="predictionLoading" />
-            </div>
-            <ModelEvidence :card="modelCard" :metrics="metrics" />
-          </section>
-          <section v-else-if="activeView === 'evidence'" class="view-stack"><ModelEvidence :card="modelCard" :metrics="metrics" /></section>
-          <section v-else-if="activeView === 'assistant'" class="view-stack">
-            <div class="content-grid assistant-grid">
-              <AssistantPanel :response="assistantResponse" :loading="assistantLoading" :error="assistantError" @submit="askQuestion" />
-              <ModelEvidence :card="modelCard" :metrics="metrics" />
-            </div>
-          </section>
-          <section v-else class="view-stack"><HistoryLog :history="history" :loading="historyLoading" :error="historyError" /></section>
-        </template>
-        <footer class="main-footer"><span>Research artifact / source-aware valuation</span><span>Experimental unless quality gate passes</span></footer>
-      </main>
-    </div>
+          <div v-if="prediction && !valuationEditing" class="result-stage">
+            <EstimatePanel :result="prediction" :input="lastValuationInput" @edit="editValuation" />
+          </div>
+        </section>
+        <section v-else-if="activeView === 'research'" class="view-stack"><ResearchOverview :card="modelCard" /></section>
+        <section v-else-if="activeView === 'assistant'" class="view-stack"><AssistantPanel :response="assistantResponse" :loading="assistantLoading" :error="assistantError" @submit="askQuestion" /></section>
+        <section v-else class="view-stack"><HistoryLog :history="history" :loading="historyLoading" :error="historyError" /></section>
+      </template>
+      <footer class="main-footer"><span>车辆估值 · INR</span><span>结果仅供参考</span></footer>
+    </main>
   </div>
 </template>
 
@@ -87,12 +58,13 @@ import { askAssistant, getHistory, getMetrics, getModelCard, getModelHealth, pre
 import AssistantPanel from './components/AssistantPanel.vue'
 import EstimatePanel from './components/EstimatePanel.vue'
 import HistoryLog from './components/HistoryLog.vue'
-import ModelEvidence from './components/ModelEvidence.vue'
 import ResearchOverview from './components/ResearchOverview.vue'
 import StatusStrip from './components/StatusStrip.vue'
 import ValuationForm from './components/ValuationForm.vue'
 
-const activeView = ref('research')
+const activeView = ref('valuation')
+const valuationEditing = ref(true)
+const lastValuationInput = ref(null)
 const initialLoading = ref(true)
 const bootError = ref('')
 const modelCard = ref(null)
@@ -109,18 +81,17 @@ const assistantLoading = ref(false)
 const assistantError = ref('')
 
 const navItems = [
-  { id: 'research', number: '01', label: '研究总览', sub: 'Research audit' },
-  { id: 'valuation', number: '02', label: '运行估值', sub: 'Estimate run' },
-  { id: 'assistant', number: '03', label: '解释助手', sub: 'Traceable assistant' },
-  { id: 'history', number: '04', label: '实验日志', sub: 'Estimation log' },
+  { id: 'valuation', label: '车辆估值' },
+  { id: 'research', label: '模型说明' },
+  { id: 'history', label: '历史记录' },
+  { id: 'assistant', label: '解释助手' },
 ]
 
 const pageMeta = {
-  research: { eyebrow: 'WORKSPACE / RESEARCH', title: '先看证据，再运行估值', description: '发布身份、交叉验证、独立测试和分组误差在这里保持可复核。' },
-  valuation: { eyebrow: 'WORKSPACE / ESTIMATE', title: '运行一次可追溯估值', description: '输入特征、运行推理、查看质量门禁和结果说明，所有价格均以 INR 展示。' },
-  evidence: { eyebrow: 'WORKSPACE / EVIDENCE', title: '先看模型证据', description: '数据来源、切分方法、基线对比和限制会在预测结果之前公开。' },
-  assistant: { eyebrow: 'WORKSPACE / EXPLANATION', title: '让估值过程可解释', description: '助手引用本地知识，并通过结构化工具调用同一个数值估值模型。' },
-  history: { eyebrow: 'WORKSPACE / LOG', title: '回看估值实验日志', description: '每次运行都会记录货币、模型版本和输入摘要，便于比较与复盘。' },
+  valuation: { title: '这辆车值多少？', description: '填写车辆信息，获得参考价格、价格区间和模型依据。结果不是交易承诺。' },
+  research: { title: '模型如何完成估值', description: '查看数据来源、验证方法、模型表现和已知限制。' },
+  history: { title: '历史估值记录', description: '回看每次估值的车辆信息、参考价格和模型版本。' },
+  assistant: { title: '估值解释助手', description: '询问数据、模型或估值过程，回答基于本地知识和同一估值模型。' },
 }
 const activeMeta = computed(() => pageMeta[activeView.value])
 
@@ -144,7 +115,10 @@ async function runValuation(payload) {
   predictionLoading.value = true
   predictionError.value = ''
   try {
-    prediction.value = await predictVehicle(payload)
+    const result = await predictVehicle(payload)
+    prediction.value = result
+    lastValuationInput.value = { ...payload }
+    valuationEditing.value = false
     historyLoading.value = true
     try {
       history.value = await getHistory()
@@ -158,9 +132,15 @@ async function runValuation(payload) {
   }
 }
 
+function editValuation() {
+  valuationEditing.value = true
+}
+
 function clearPrediction() {
   prediction.value = null
+  lastValuationInput.value = null
   predictionError.value = ''
+  valuationEditing.value = true
 }
 
 async function askQuestion(message) {
