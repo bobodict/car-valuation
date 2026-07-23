@@ -57,6 +57,21 @@ test('defines exact step IDs and assigns every prediction field once', () => {
   assert.equal(new Set(fields).size, fields.length)
 })
 
+test('keeps accident history validation on the final step', () => {
+  const emptyResult = validateValuationStep(
+    { ...validForm, accident_history: '' },
+    3,
+    2026,
+  )
+
+  assert.equal(emptyResult.errors.accident_history, '请填写事故历史')
+  assert.equal(emptyResult.firstInvalidField, 'accident_history')
+  assert.deepEqual(validateValuationStep(validForm, 3, 2026), {
+    errors: {},
+    firstInvalidField: null,
+  })
+})
+
 test('validates only the current step and reports the first invalid field', () => {
   const result = validateValuationStep(
     { ...validForm, year: 1979, mileage: -1, displacement: 20 },
