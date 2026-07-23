@@ -77,6 +77,7 @@ test('keeps guided form controls aligned with the input contract', () => {
   assert.match(mileage, /max="10000000"/)
   assert.match(mileage, /step="1"/)
 
+  assert.match(valuationFormSource, /<button\b[^>]*type="button"[^>]*@click="resetForm"[^>]*>重新填写<\/button>/)
   assert.match(valuationFormSource, /loading \? '正在估算' : '开始估值'/)
   assert.match(valuationFormSource, /function replaceErrors\(errors\) \{[\s\S]*Object\.keys\(fieldErrors\)\.forEach[\s\S]*Object\.assign\(fieldErrors, errors\)/)
   assert.match(valuationFormSource, /function validateCurrentStep\(\) \{[\s\S]*replaceErrors\(result\.errors\)/)

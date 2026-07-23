@@ -265,6 +265,7 @@
       </fieldset>
 
       <div class="form-actions wizard-actions">
+        <button type="button" class="button button-quiet" :disabled="loading" @click="resetForm">重新填写</button>
         <button v-if="activeStep > 0" type="button" class="button button-quiet" :disabled="loading" @click="previousStep">返回</button>
         <button v-if="!isFinalStep" type="button" class="button button-primary" :disabled="loading" @click="nextStep">继续</button>
         <button v-else type="submit" class="button button-primary" :disabled="loading">{{ loading ? '正在估算' : '开始估值' }}</button>
@@ -314,45 +315,55 @@ function replaceErrors(errors) {
   Object.assign(fieldErrors, errors)
 }
 
-function focusField(field) {
+async function focusField(field) {
   if (!field) return
-  nextTick(() => document.getElementById(field)?.focus())
+  try {
+    await nextTick()
+    document.getElementById(field)?.focus()
+  } catch {
+    // Focus is best-effort and must not block the valuation flow.
+  }
 }
 
-function focusFormTitle() {
-  nextTick(() => document.getElementById('valuation-form-title')?.focus())
+async function focusFormTitle() {
+  try {
+    await nextTick()
+    document.getElementById('valuation-form-title')?.focus()
+  } catch {
+    // Focus is best-effort and must not block the valuation flow.
+  }
 }
 
-function validateCurrentStep() {
+async function validateCurrentStep() {
   const result = validateValuationStep(form, activeStep.value, currentYear)
   replaceErrors(result.errors)
-  if (result.firstInvalidField) focusField(result.firstInvalidField)
+  if (result.firstInvalidField) await focusField(result.firstInvalidField)
   return Object.keys(result.errors).length === 0
 }
 
-function nextStep() {
+async function nextStep() {
   if (props.loading) return
-  if (!validateCurrentStep()) return
+  if (!await validateCurrentStep()) return
   activeStep.value += 1
-  focusFormTitle()
+  await focusFormTitle()
 }
 
-function previousStep() {
+async function previousStep() {
   if (props.loading) return
   if (activeStep.value === 0) return
   activeStep.value -= 1
   replaceErrors({})
-  focusFormTitle()
+  await focusFormTitle()
 }
 
-function submitForm() {
+async function submitForm() {
   if (props.loading) return
-  if (validateCurrentStep()) emit('submit', { ...form })
+  if (await validateCurrentStep()) emit('submit', { ...form })
 }
 
-function handleSubmit() {
-  if (isFinalStep.value) submitForm()
-  else nextStep()
+async function handleSubmit() {
+  if (isFinalStep.value) await submitForm()
+  else await nextStep()
 }
 
 function resetForm() {
