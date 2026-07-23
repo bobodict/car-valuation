@@ -261,6 +261,9 @@ def write_cache_v3_publication(
     (root / "feature_config.json").write_text(
         json.dumps({"marker": feature_marker}, sort_keys=True), encoding="utf-8"
     )
+    (root / ".publication-generation.json").write_text(
+        json.dumps({"generation": "generation-v1"}, sort_keys=True), encoding="utf-8"
+    )
     (root / "winner.joblib").write_bytes(artifact_bytes)
 
 

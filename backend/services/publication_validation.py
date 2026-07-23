@@ -48,6 +48,30 @@ def resolve_v3_report_path(root: str | Path, filename: str) -> Path:
     return report_path
 
 
+def _validate_publication_generation(root: Path) -> None:
+    """Require a valid publication generation marker for formal v3 releases."""
+    generation_path = resolve_v3_report_path(root, PUBLICATION_GENERATION_FILENAME)
+    try:
+        with generation_path.open("r", encoding="utf-8") as generation_file:
+            generation = json.load(generation_file)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            "formal v3 publication generation metadata is required"
+        ) from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "publication generation metadata contains invalid JSON"
+        ) from exc
+
+    if not isinstance(generation, Mapping):
+        raise ValueError("publication generation metadata must be an object")
+    token = generation.get("generation")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError(
+            "publication generation metadata generation must be a nonempty string"
+        )
+
+
 def _load_manifest(root: Path) -> Mapping[str, Any] | None:
     manifest_path = resolve_v3_report_path(root, "model_manifest.json")
     try:
@@ -69,7 +93,9 @@ def is_formal_v3_manifest(root: str | Path) -> bool:
     return manifest is not None and manifest.get("artifact_version") == V3_ARTIFACT_VERSION
 
 
-def validate_formal_v3_reports(root: str | Path) -> dict[str, Any] | None:
+def validate_formal_v3_reports(
+    root: str | Path, *, require_generation: bool = True
+) -> dict[str, Any] | None:
     """Strictly validate a complete v3 report set when one is present.
 
     Lightweight v3 runtime fixtures and legacy publications intentionally do
@@ -82,6 +108,8 @@ def validate_formal_v3_reports(root: str | Path) -> dict[str, Any] | None:
         return None
     if manifest.get("artifact_version") != V3_ARTIFACT_VERSION:
         return None
+    if require_generation:
+        _validate_publication_generation(publication_root)
     report_paths = {
         filename: resolve_v3_report_path(publication_root, filename)
         for filename in V3_REPORT_FILES

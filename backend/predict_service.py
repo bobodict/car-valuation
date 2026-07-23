@@ -175,6 +175,8 @@ def _v3_identity(
     if report_before is not None:
         report_digests = _report_digests(root)
     generation_before = _generation_identity(root)
+    if formal_v3 and generation_before is None:
+        raise OSError("formal v3 publication generation metadata is required")
 
     directory_after = _directory_stat(root)
     manifest_after = _file_stat(manifest_path, "model_manifest.json")
@@ -218,17 +220,44 @@ def _v3_identity(
 def _legacy_identity(
     root: Path, directory_before: tuple[Any, ...], manifest_path: Path
 ) -> tuple[Any, ...]:
+    legacy_config_path = root / "legacy_feature_config.json"
     feature_path = root / "feature_config.json"
     preprocess_path = root / "preprocess.joblib"
     model_path = root / "price_mlp.pt"
+    try:
+        legacy_config_before = _file_stat(
+            legacy_config_path, "legacy_feature_config.json"
+        )
+    except FileNotFoundError:
+        legacy_config_before = None
     feature_before = _file_stat(feature_path, "feature_config.json")
     preprocess_before = _file_stat(preprocess_path, "preprocess.joblib")
     model_before = _file_stat(model_path, "price_mlp.pt")
 
+    if legacy_config_before is not None:
+        legacy_config_contents = legacy_config_path.read_bytes()
+        _, legacy_config_digest = _json_object(
+            legacy_config_contents, "legacy_feature_config.json"
+        )
+    else:
+        legacy_config_digest = None
     feature_contents = feature_path.read_bytes()
     _, feature_digest = _json_object(feature_contents, "feature_config.json")
 
     directory_after = _directory_stat(root)
+    try:
+        legacy_config_after = _file_stat(
+            legacy_config_path, "legacy_feature_config.json"
+        )
+    except FileNotFoundError:
+        legacy_config_after = None
+    if legacy_config_after is not None:
+        legacy_config_contents_after = legacy_config_path.read_bytes()
+        _, legacy_config_digest_after = _json_object(
+            legacy_config_contents_after, "legacy_feature_config.json"
+        )
+    else:
+        legacy_config_digest_after = None
     feature_after = _file_stat(feature_path, "feature_config.json")
     preprocess_after = _file_stat(preprocess_path, "preprocess.joblib")
     model_after = _file_stat(model_path, "price_mlp.pt")
@@ -240,6 +269,8 @@ def _legacy_identity(
         raise OSError("model manifest appeared while legacy identity was read")
     if (
         directory_before != directory_after
+        or legacy_config_before != legacy_config_after
+        or legacy_config_digest != legacy_config_digest_after
         or feature_before != feature_after
         or preprocess_before != preprocess_after
         or model_before != model_after
@@ -248,6 +279,7 @@ def _legacy_identity(
     return (
         "legacy",
         directory_after,
+        (legacy_config_after, legacy_config_digest),
         (feature_after, feature_digest),
         preprocess_after,
         model_after,

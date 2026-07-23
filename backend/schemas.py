@@ -139,6 +139,8 @@ class ModelCardResponse(BaseModel):
     category_options: dict[str, list[str]] = Field(default_factory=dict)
     feature_descriptions: dict[str, str] = Field(default_factory=dict)
     limitations: list[str] = Field(default_factory=list)
+    cv_selection: dict = Field(default_factory=dict)
+    independent_holdout: dict = Field(default_factory=dict)
     leaderboard: dict = Field(default_factory=dict)
     error_analysis: dict = Field(default_factory=dict)
 

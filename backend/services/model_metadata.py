@@ -54,7 +54,12 @@ def load_model_card(path: str | Path | None = None) -> dict:
         if initial_is_stale:
             raise ValueError("model publication changed while model card was read")
 
-    formal_reports = validate_formal_v3_reports(card_path.parent)
+    if checks_publication:
+        formal_reports = validate_formal_v3_reports(card_path.parent)
+    else:
+        formal_reports = validate_formal_v3_reports(
+            card_path.parent, require_generation=False
+        )
     if formal_reports is None:
         with card_path.open("r", encoding="utf-8") as card_file:
             card = json.load(card_file)

@@ -71,6 +71,30 @@ def make_metrics(**overrides):
 
 
 class ModelMetadataTests(unittest.TestCase):
+    def test_formal_v3_publication_requires_generation_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            (root / ".publication-generation.json").unlink()
+
+            with self.assertRaisesRegex(ValueError, "publication generation"):
+                publication_validation.validate_formal_v3_reports(root)
+
+    def test_legacy_config_change_invalidates_legacy_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            (root / "model_manifest.json").rename(root / "model_manifest.json.disabled")
+            config_path = root / "legacy_feature_config.json"
+
+            first = predict_service._published_artifact_identity(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["model_version"] = "mlp-republished"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            second = predict_service._published_artifact_identity(root)
+
+        self.assertNotEqual(first, second)
+
     def test_republication_generation_is_part_of_model_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "models"
@@ -126,6 +150,8 @@ class ModelMetadataTests(unittest.TestCase):
         card = make_card(
             feature_version="3.0.0",
             model_type="catboost",
+            cv_selection={"scope": "development_cv_only", "winner_cv": {"r2_mean": 0.8}},
+            independent_holdout={"scope": "recorded_test", "count": 2, "metrics": {"r2": 0.7}},
             leaderboard={"winner": "catboost"},
             error_analysis={"segment": "rare"},
         )
@@ -147,6 +173,8 @@ class ModelMetadataTests(unittest.TestCase):
         self.assertEqual(
             card_response["error_analysis"], {"segment": "rare"}
         )
+        self.assertEqual(card_response["cv_selection"]["scope"], "development_cv_only")
+        self.assertEqual(card_response["independent_holdout"]["scope"], "recorded_test")
 
     def test_v2_model_card_gets_safe_evidence_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
