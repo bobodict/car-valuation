@@ -379,6 +379,12 @@ test('keeps incomplete result input ready for the rendered vehicle summary', () 
   assert.match(estimatePanelSource, /getValuationSummary\(props\.input \|\| \{\}\)/)
 })
 
+test('renders a missing result range through safe optional access', () => {
+  assert.match(estimatePanelSource, /result\.range\?\.low/)
+  assert.match(estimatePanelSource, /result\.range\?\.high/)
+  assert.doesNotMatch(estimatePanelSource, /result\.range\.(?:low|high)/)
+})
+
 test('keeps valuation evidence progressive and scoped to the result view', () => {
   assert.ok(appSource.includes("import ModelEvidence from './components/ModelEvidence.vue'"))
   assert.match(appSource, /<details class="evidence-disclosure">[\s\S]*查看估值依据[\s\S]*模型指标、数据来源和适用边界[\s\S]*disclosure-mark[\s\S]*\+[\s\S]*<ModelEvidence :card="modelCard" :metrics="metrics" \/>/)
