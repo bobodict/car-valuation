@@ -31,8 +31,8 @@ export function validateValuationStep(form, stepIndex, currentYear = new Date().
   }
 
   Object.keys(requiredLabels).forEach(required)
-  if (fields.includes('year') && !isNumberInRange(form.year, 1980, currentYear)) errors.year = `年份应在 1980 到 ${currentYear} 之间`
-  if (fields.includes('month') && !isNumberInRange(form.month, 1, 12)) errors.month = '月份应在 1 到 12 之间'
+  if (fields.includes('year') && !isNumberInRange(form.year, 1980, currentYear, true)) errors.year = `年份应在 1980 到 ${currentYear} 之间`
+  if (fields.includes('month') && !isNumberInRange(form.month, 1, 12, true)) errors.month = '月份应在 1 到 12 之间'
   if (fields.includes('mileage') && !isNumberInRange(form.mileage, 0, 10_000_000)) errors.mileage = '请输入 0 到 10,000,000 之间的公里数'
   if (fields.includes('owner_count') && !isNumberInRange(form.owner_count, 1, 20, true)) errors.owner_count = '车主次数应在 1 到 20 之间'
   if (fields.includes('displacement') && !isNumberInRange(form.displacement, 0, 10)) errors.displacement = '排量应在 0 到 10 L 之间'
