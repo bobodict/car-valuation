@@ -43,7 +43,13 @@
             <h1 class="sr-only">车辆估值结果</h1>
             <div v-if="historyError" class="inline-error" role="alert">{{ historyError }}</div>
             <EstimatePanel :result="prediction" :input="lastValuationInput" @edit="editValuation" />
-            <button class="button button-quiet" type="button" @click="editValuation">修改车辆信息</button>
+            <details class="evidence-disclosure">
+              <summary>
+                <span class="disclosure-copy"><strong>查看估值依据</strong><span>模型指标、数据来源和适用边界</span></span>
+                <span class="disclosure-mark" aria-hidden="true">+</span>
+              </summary>
+              <div class="evidence-disclosure-body"><ModelEvidence :card="modelCard" :metrics="metrics" /></div>
+            </details>
           </div>
         </section>
         <section v-if="activeView === 'research'" class="view-stack"><ResearchOverview :card="modelCard" /></section>
@@ -61,6 +67,7 @@ import { askAssistant, getHistory, getMetrics, getModelCard, getModelHealth, pre
 import AssistantPanel from './components/AssistantPanel.vue'
 import EstimatePanel from './components/EstimatePanel.vue'
 import HistoryLog from './components/HistoryLog.vue'
+import ModelEvidence from './components/ModelEvidence.vue'
 import ResearchOverview from './components/ResearchOverview.vue'
 import StatusStrip from './components/StatusStrip.vue'
 import ValuationForm from './components/ValuationForm.vue'

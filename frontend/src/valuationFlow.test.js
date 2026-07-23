@@ -19,6 +19,14 @@ const valuationFormSource = readFileSync(
   new URL('./components/ValuationForm.vue', import.meta.url),
   'utf8',
 )
+const estimatePanelSource = readFileSync(
+  new URL('./components/EstimatePanel.vue', import.meta.url),
+  'utf8',
+)
+const appSource = readFileSync(
+  new URL('./App.vue', import.meta.url),
+  'utf8',
+)
 
 function controlTag(field) {
   const match = valuationFormSource.match(
@@ -364,4 +372,14 @@ test('uses explicit placeholders for empty and nullish result summaries', () => 
   assert.deepEqual(getValuationSummary({}), emptySummary)
   assert.deepEqual(getValuationSummary(undefined), emptySummary)
   assert.deepEqual(getValuationSummary(null), emptySummary)
+})
+
+test('keeps incomplete result input ready for the rendered vehicle summary', () => {
+  assert.deepEqual(getValuationSummary({}), emptySummary)
+  assert.match(estimatePanelSource, /getValuationSummary\(props\.input \|\| \{\}\)/)
+})
+
+test('keeps valuation evidence progressive and scoped to the result view', () => {
+  assert.ok(appSource.includes("import ModelEvidence from './components/ModelEvidence.vue'"))
+  assert.match(appSource, /<details class="evidence-disclosure">[\s\S]*查看估值依据[\s\S]*模型指标、数据来源和适用边界[\s\S]*disclosure-mark[\s\S]*\+[\s\S]*<ModelEvidence :card="modelCard" :metrics="metrics" \/>/)
 })
