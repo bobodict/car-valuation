@@ -6,7 +6,7 @@ product
 
 ## Users
 
-Graduate-admissions reviewers and technical users who need to inspect, test, and explain a used-car valuation model. The primary context is repeated review of model evidence, with occasional interactive valuation runs and traceable assistance.
+Technical reviewers and technical users who need to inspect, test, and explain a used-car valuation model. The primary context is repeated review of model evidence, with occasional interactive valuation runs and traceable assistance.
 
 ## Product Purpose
 

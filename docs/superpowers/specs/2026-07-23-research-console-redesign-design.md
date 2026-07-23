@@ -2,7 +2,7 @@
 
 ## Design Read
 
-This is a research console for graduate-admissions reviewers and technical users. It should feel like a source-aware model audit notebook: quiet, precise, and readable under repeated inspection. The visual language uses warm paper, ink, signal orange, and cold blue rather than a generic SaaS gradient.
+This is a research console for technical reviewers and technical users. It should feel like a source-aware model audit notebook: quiet, precise, and readable under repeated inspection. The visual language uses warm paper, ink, signal orange, and cold blue rather than a generic SaaS gradient.
 
 ## Goals
 
