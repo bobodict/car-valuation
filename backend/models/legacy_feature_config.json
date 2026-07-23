@@ -1,0 +1,40 @@
+{
+  "artifact_version": "2.0.0",
+  "target_col": "price",
+  "feature_cols": [
+    "mileage",
+    "displacement",
+    "seats",
+    "owner_count",
+    "car_age",
+    "brand",
+    "model",
+    "city",
+    "transmission",
+    "fuel_type",
+    "vehicle_type",
+    "color",
+    "accident_history"
+  ],
+  "numeric_features": [
+    "mileage",
+    "displacement",
+    "seats",
+    "owner_count",
+    "car_age"
+  ],
+  "categorical_features": [
+    "brand",
+    "model",
+    "city",
+    "transmission",
+    "fuel_type",
+    "vehicle_type",
+    "color",
+    "accident_history"
+  ],
+  "currency": "INR",
+  "price_unit": "INR",
+  "mileage_unit": "km",
+  "model_version": "mlp-20260722121554"
+}

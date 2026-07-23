@@ -11,7 +11,9 @@ from typing import Any, NamedTuple
 from config import settings
 from services.model_runtime import ModelRuntime, ModelRuntimeError
 from services.publication_validation import (
+    PUBLICATION_GENERATION_FILENAME,
     V3_REPORT_FILES,
+    is_reparse_point,
     resolve_v3_report_path,
 )
 
@@ -47,6 +49,8 @@ def _file_stat(path: Path, identity_name: str) -> tuple[Any, ...]:
 
 
 def _directory_stat(path: Path) -> tuple[Any, ...]:
+    if is_reparse_point(path):
+        raise ValueError("published models directory must not be a symlink or junction")
     details = path.stat()
     if not stat.S_ISDIR(details.st_mode):
         raise FileNotFoundError(
@@ -91,6 +95,22 @@ def _report_digests(root: Path) -> tuple[tuple[str, str], ...]:
         )
         for filename in V3_REPORT_FILES
     )
+
+
+def _generation_identity(root: Path) -> tuple[Any, ...] | None:
+    path = root / PUBLICATION_GENERATION_FILENAME
+    try:
+        stat_details = _file_stat(path, PUBLICATION_GENERATION_FILENAME)
+    except FileNotFoundError:
+        return None
+    contents = path.read_bytes()
+    generation, digest = _json_object(contents, PUBLICATION_GENERATION_FILENAME)
+    token = generation.get("generation")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError(
+            f"{PUBLICATION_GENERATION_FILENAME} generation must be a nonempty string"
+        )
+    return stat_details, digest, token
 
 
 def _artifact_paths(
@@ -154,6 +174,7 @@ def _v3_identity(
     report_digests = None
     if report_before is not None:
         report_digests = _report_digests(root)
+    generation_before = _generation_identity(root)
 
     directory_after = _directory_stat(root)
     manifest_after = _file_stat(manifest_path, "model_manifest.json")
@@ -167,6 +188,7 @@ def _v3_identity(
     if report_before is not None:
         report_after = _report_stats(root)
         report_digests_after = _report_digests(root)
+    generation_after = _generation_identity(root)
     if (
         directory_before != directory_after
         or manifest_before != manifest_after
@@ -174,6 +196,7 @@ def _v3_identity(
         or artifacts_before != artifacts_after
         or report_before is not None and report_before != report_after
         or report_before is not None and report_digests != report_digests_after
+        or generation_before != generation_after
     ):
         raise OSError("v3 publication changed while its identity was read")
     return (
@@ -188,6 +211,7 @@ def _v3_identity(
                 report_after or (), report_digests_after or ()
             )
         ),
+        generation_after,
     )
 
 

@@ -3,6 +3,7 @@ import importlib
 import json
 import math
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -33,7 +34,7 @@ from services.model_competition import (
     _build_fold_preprocessor,
 )
 from services import model_runtime as model_runtime_module
-from services.model_runtime import ModelRuntime, ModelRuntimeError
+from services.model_runtime import LegacyTorchRuntime, ModelRuntime, ModelRuntimeError
 
 
 EXPECTED_PRICE = 505_000.0
@@ -291,6 +292,17 @@ def write_cache_legacy_publication(root, model_bytes=b"legacy-model-v1"):
 
 
 class ModelRuntimeLoadingTests(unittest.TestCase):
+    def test_checked_in_legacy_bundle_loads_without_v3_manifest(self):
+        source = Path(__file__).parents[1] / "models"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(source, root)
+            (root / "model_manifest.json").rename(root / "model_manifest.json.disabled")
+
+            runtime = ModelRuntime.from_directory(root)
+
+        self.assertIsInstance(runtime._implementation, LegacyTorchRuntime)
+
     def test_loads_bundle_written_by_production_extra_trees_adapter(self):
         source = raw_vehicles(4)
         training_frame = enrich_features(source, 2026).loc[:, MODEL_FEATURES]

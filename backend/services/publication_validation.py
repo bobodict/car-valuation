@@ -7,6 +7,7 @@ from typing import Any
 
 
 V3_ARTIFACT_VERSION = "3.0.0"
+PUBLICATION_GENERATION_FILENAME = ".publication-generation.json"
 V3_REPORT_FILES = (
     "model_manifest.json",
     "feature_config.json",
@@ -17,9 +18,23 @@ V3_REPORT_FILES = (
 )
 
 
+def is_reparse_point(path: str | Path) -> bool:
+    """Return whether a path is a symlink or Windows reparse-point root."""
+    candidate = Path(path)
+    if candidate.is_symlink():
+        return True
+    try:
+        details = candidate.lstat()
+    except FileNotFoundError:
+        return False
+    return bool(getattr(details, "st_file_attributes", 0) & 0x400)
+
+
 def resolve_v3_report_path(root: str | Path, filename: str) -> Path:
     """Resolve a required report path without allowing symlinks or escapes."""
     publication_root = Path(root)
+    if is_reparse_point(publication_root):
+        raise ValueError("formal publication directory must not be a symlink or junction")
     report_path = publication_root / filename
     if report_path.is_symlink():
         raise ValueError(f"formal v3 report must not be a symlink: {filename}")

@@ -26,6 +26,7 @@ from services.feature_engineering import (
     enrich_features,
 )
 from services.model_competition import MLPRegressor
+from services.publication_validation import is_reparse_point
 
 
 ARTIFACT_VERSION = "3.0.0"
@@ -70,8 +71,8 @@ def _load_json_object(path: Path, label: str) -> dict[str, Any]:
 
 
 def _validated_models_root(root: Path) -> Path:
-    if root.is_symlink():
-        raise ValueError("models directory must not be a symlink")
+    if is_reparse_point(root):
+        raise ValueError("models directory must not be a symlink or junction")
     if not root.is_dir():
         raise FileNotFoundError(f"models directory does not exist: {root}")
     return root.resolve(strict=True)
@@ -549,9 +550,11 @@ class LegacyTorchRuntime:
 
     @classmethod
     def from_directory(cls, root: Path):
-        config_path = _resolve_models_file(
-            root, "feature_config.json", "feature_config.json"
-        )
+        config_path = _optional_models_file(root, "legacy_feature_config.json")
+        if config_path is None:
+            config_path = _resolve_models_file(
+                root, "feature_config.json", "feature_config.json"
+            )
         preprocessor_path = _resolve_models_file(
             root, "preprocess.joblib", "legacy preprocessor artifact"
         )

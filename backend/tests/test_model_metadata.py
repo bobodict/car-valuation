@@ -71,6 +71,36 @@ def make_metrics(**overrides):
 
 
 class ModelMetadataTests(unittest.TestCase):
+    def test_republication_generation_is_part_of_model_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            generation_path = root / ".publication-generation.json"
+            generation_path.write_text(
+                json.dumps({"generation": "generation-a"}), encoding="utf-8"
+            )
+
+            first = predict_service._published_artifact_identity(root)
+            generation_path.write_text(
+                json.dumps({"generation": "generation-b"}), encoding="utf-8"
+            )
+            second = predict_service._published_artifact_identity(root)
+
+        self.assertNotEqual(first[-1], second[-1])
+
+    def test_formal_publication_root_reparse_point_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            with patch.object(
+                Path,
+                "is_symlink",
+                autospec=True,
+                side_effect=lambda path: path.name == "models",
+            ):
+                with self.assertRaisesRegex(ValueError, "directory.*symlink"):
+                    publication_validation.validate_formal_v3_reports(root)
+
     def test_api_response_models_return_v3_metadata_and_evidence(self):
         metrics = make_metrics(model_type="catboost", feature_version="3.0.0")
         health = {

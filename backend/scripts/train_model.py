@@ -43,6 +43,7 @@ from services.model_competition import (
     rank_candidates,
 )
 from services.split_service import build_split_manifest
+from services.publication_validation import PUBLICATION_GENERATION_FILENAME
 
 
 SEED = 42
@@ -175,6 +176,16 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> Path:
     )
     path.write_text(f"{content}\n", encoding="utf-8")
     return path
+
+
+def _write_publication_generation(directory: Path) -> Path:
+    return _write_json(
+        directory / PUBLICATION_GENERATION_FILENAME,
+        {
+            "generation": uuid.uuid4().hex,
+            "published_at": _utc_now().isoformat(),
+        },
+    )
 
 
 def _reject_json_constant(value: str):
@@ -2506,6 +2517,7 @@ def publish_experiment(
         try:
             shutil.copytree(experiment_dir, staging_dir)
             _write_ownership_sentinel(staging_dir)
+            _write_publication_generation(staging_dir)
             _write_published_run_status(
                 experiment_dir,
                 staging_dir,
