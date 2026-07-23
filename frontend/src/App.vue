@@ -56,7 +56,10 @@
         </div>
         <template v-else>
           <StatusStrip :health="health" :metrics="metrics" :card="modelCard" />
-          <section v-if="activeView === 'valuation'" class="view-stack">
+          <section v-if="activeView === 'research'" class="view-stack">
+            <ResearchOverview :card="modelCard" />
+          </section>
+          <section v-else-if="activeView === 'valuation'" class="view-stack">
             <div class="content-grid">
               <ValuationForm :card="modelCard" :loading="predictionLoading" :error="predictionError" @submit="runValuation" @reset="clearPrediction" />
               <EstimatePanel :result="prediction" :loading="predictionLoading" />
@@ -85,10 +88,11 @@ import AssistantPanel from './components/AssistantPanel.vue'
 import EstimatePanel from './components/EstimatePanel.vue'
 import HistoryLog from './components/HistoryLog.vue'
 import ModelEvidence from './components/ModelEvidence.vue'
+import ResearchOverview from './components/ResearchOverview.vue'
 import StatusStrip from './components/StatusStrip.vue'
 import ValuationForm from './components/ValuationForm.vue'
 
-const activeView = ref('valuation')
+const activeView = ref('research')
 const initialLoading = ref(true)
 const bootError = ref('')
 const modelCard = ref(null)
@@ -105,13 +109,14 @@ const assistantLoading = ref(false)
 const assistantError = ref('')
 
 const navItems = [
-  { id: 'valuation', number: '01', label: '运行估值', sub: 'Estimate run' },
-  { id: 'evidence', number: '02', label: '模型证据', sub: 'Model evidence' },
+  { id: 'research', number: '01', label: '研究总览', sub: 'Research audit' },
+  { id: 'valuation', number: '02', label: '运行估值', sub: 'Estimate run' },
   { id: 'assistant', number: '03', label: '解释助手', sub: 'Traceable assistant' },
   { id: 'history', number: '04', label: '实验日志', sub: 'Estimation log' },
 ]
 
 const pageMeta = {
+  research: { eyebrow: 'WORKSPACE / RESEARCH', title: '先看证据，再运行估值', description: '发布身份、交叉验证、独立测试和分组误差在这里保持可复核。' },
   valuation: { eyebrow: 'WORKSPACE / ESTIMATE', title: '运行一次可追溯估值', description: '输入特征、运行推理、查看质量门禁和结果说明，所有价格均以 INR 展示。' },
   evidence: { eyebrow: 'WORKSPACE / EVIDENCE', title: '先看模型证据', description: '数据来源、切分方法、基线对比和限制会在预测结果之前公开。' },
   assistant: { eyebrow: 'WORKSPACE / EXPLANATION', title: '让估值过程可解释', description: '助手引用本地知识，并通过结构化工具调用同一个数值估值模型。' },

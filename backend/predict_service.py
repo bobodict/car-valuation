@@ -1,105 +1,432 @@
-"""Load the supplied regression artifact and run one deterministic prediction."""
+"""Lazy, publication-aware model-runtime adapter used by the API service."""
 
-from datetime import date
+from collections.abc import Mapping
+import hashlib
 import json
-
-import joblib
-import pandas as pd
-import torch
-from torch import nn
+from pathlib import Path
+import stat
+import threading
+from typing import Any, NamedTuple
 
 from config import settings
+from services.model_runtime import ModelRuntime, ModelRuntimeError
+from services.publication_validation import (
+    PUBLICATION_GENERATION_FILENAME,
+    V3_REPORT_FILES,
+    is_reparse_point,
+    resolve_v3_report_path,
+)
 
-MODELS_DIR = settings.models_dir
-PREPROCESS_PATH = settings.preprocess_path
-FEATURE_CONFIG_PATH = settings.feature_config_path
-MODEL_PATH = settings.model_path
 
-# 读特征配置
-with open(FEATURE_CONFIG_PATH, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
+_runtime_lock = threading.RLock()
+_cached_runtime: ModelRuntime | None = None
+_cached_identity: tuple[Any, ...] | None = None
+_identity_failure_count = 0
 
-FEATURE_COLS = cfg["feature_cols"]
-NUMERIC_FEATURES = cfg["numeric_features"]
-CATEGORICAL_FEATURES = cfg["categorical_features"]
+_STALE_IDENTITY_FAILURE_LIMIT = 1
+_PUBLICATION_LOAD_ATTEMPTS = 3
 
-preprocess = joblib.load(PREPROCESS_PATH)
 
-class MLPRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dims, dropout=0.0):
-        super().__init__()
-        layers = []
-        prev = input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(prev, h))
-            layers.append(nn.ReLU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            prev = h
-        layers.append(nn.Linear(prev, 1))
-        self.net = nn.Sequential(*layers)
+class ModelPublicationState(NamedTuple):
+    identity: tuple[Any, ...]
+    used_cached_runtime: bool
 
-    def forward(self, x):
-        return self.net(x)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _file_stat(path: Path, identity_name: str) -> tuple[Any, ...]:
+    if path.is_symlink():
+        raise ValueError(f"published file must not be a symlink: {identity_name}")
+    details = path.stat()
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError(f"published model artifact is not a file: {identity_name}")
+    return (
+        identity_name,
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
 
-ckpt = torch.load(MODEL_PATH, map_location=device)
-input_dim = ckpt["input_dim"]
-hidden_dims = ckpt["hidden_dims"]
-dropout = ckpt.get("dropout", 0.0)
-TARGET_MEAN = float(ckpt.get("target_mean", 0.0))
-TARGET_STD = float(ckpt.get("target_std", 1.0))
 
-model = MLPRegressor(input_dim, hidden_dims, dropout).to(device)
-model.load_state_dict(ckpt["model_state"])
-model.eval()
+def _directory_stat(path: Path) -> tuple[Any, ...]:
+    if is_reparse_point(path):
+        raise ValueError("published models directory must not be a symlink or junction")
+    details = path.stat()
+    if not stat.S_ISDIR(details.st_mode):
+        raise FileNotFoundError(
+            f"published models directory is unavailable: {path}"
+        )
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
 
-def predict_price_one(car_dict: dict) -> float:
-    """
-    car_dict: 车辆属性字典，包含训练时使用的字段：
-      brand, model, year, mileage, city, transmission, fuel_type,
-      displacement, vehicle_type, color, seats, accident_history,
-      owner_count, collection_time (car_age 会在训练时生成，如果前端不给就由后端算)
-    这里简化为：你传入 FEATURE_COLS 中的字段即可。
-    """
-    df = pd.DataFrame([car_dict])
-    # 如果前端没算 car_age，这里可以算一下（可选）
-    if "car_age" in NUMERIC_FEATURES and "car_age" not in df.columns:
-        if "collection_time" in df.columns and "year" in df.columns:
-            df["collection_time"] = pd.to_datetime(df["collection_time"], errors="coerce")
-            df["car_age"] = (
-                df["collection_time"].dt.year.fillna(date.today().year) - df["year"]
-            ).clip(lower=0)
-        elif "year" in df.columns:
-            df["car_age"] = date.today().year - df["year"]
 
-    X = df.reindex(columns=FEATURE_COLS)
-    X_proc = preprocess.transform(X)
-    if hasattr(X_proc, "toarray"):
-        X_proc = X_proc.toarray()
-    X_tensor = torch.from_numpy(X_proc.astype("float32")).to(device)
+def _json_object(contents: bytes, label: str) -> tuple[dict[str, Any], str]:
+    try:
+        value = json.loads(contents.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} contains invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must contain a JSON object")
+    return value, hashlib.sha256(contents).hexdigest()
 
-    with torch.no_grad():
-        scaled_prediction = model(X_tensor).cpu().numpy().flatten()[0]
 
-    return float(scaled_prediction * TARGET_STD + TARGET_MEAN)
+def _report_stats(root: Path) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    return tuple(
+        (
+            filename,
+            _file_stat(resolve_v3_report_path(root, filename), filename),
+        )
+        for filename in V3_REPORT_FILES
+    )
 
-if __name__ == "__main__":
-    example = {
-        "brand": "丰田",
-        "model": "凯美瑞",
-        "year": 2018,
-        "mileage": 60000,
-        "city": "广州",
-        "transmission": "自动",
-        "fuel_type": "汽油",
-        "displacement": 2.0,
-        "vehicle_type": "轿车",
-        "color": "白色",
-        "seats": 5,
-        "accident_history": "无事故",
-        "owner_count": 1,
-        "collection_time": "2026-01-01",
-    }
-    print("预测价格：", predict_price_one(example))
+
+def _report_digests(root: Path) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            filename,
+            hashlib.sha256(
+                resolve_v3_report_path(root, filename).read_bytes()
+            ).hexdigest(),
+        )
+        for filename in V3_REPORT_FILES
+    )
+
+
+def _generation_identity(root: Path) -> tuple[Any, ...] | None:
+    path = root / PUBLICATION_GENERATION_FILENAME
+    try:
+        stat_details = _file_stat(path, PUBLICATION_GENERATION_FILENAME)
+    except FileNotFoundError:
+        return None
+    contents = path.read_bytes()
+    generation, digest = _json_object(contents, PUBLICATION_GENERATION_FILENAME)
+    token = generation.get("generation")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError(
+            f"{PUBLICATION_GENERATION_FILENAME} generation must be a nonempty string"
+        )
+    return stat_details, digest, token
+
+
+def _artifact_paths(
+    root: Path, manifest: Mapping[str, Any]
+) -> tuple[tuple[str, str, Path], ...]:
+    declared = manifest.get("model_artifacts")
+    if not isinstance(declared, Mapping) or not declared:
+        raise ValueError("model_manifest.json model_artifacts must be an object")
+    resolved_root = root.resolve(strict=True)
+    artifacts = []
+    for role, relative_name in declared.items():
+        if (
+            not isinstance(role, str)
+            or not role
+            or not isinstance(relative_name, str)
+            or not relative_name.strip()
+        ):
+            raise ValueError(
+                "model_manifest.json model_artifacts must map names to paths"
+            )
+        relative_path = Path(relative_name)
+        if relative_path.is_absolute():
+            raise ValueError(f"model artifact path is outside models directory: {role}")
+        artifact_path = root / relative_path
+        resolved_artifact = artifact_path.resolve(strict=False)
+        if resolved_artifact == resolved_root or resolved_root not in resolved_artifact.parents:
+            raise ValueError(f"model artifact path is outside models directory: {role}")
+        artifacts.append((role, relative_name, artifact_path))
+    return tuple(sorted(artifacts))
+
+
+def _v3_identity(
+    root: Path,
+    directory_before: tuple[Any, ...],
+    manifest_path: Path,
+    manifest_before: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    manifest_contents = manifest_path.read_bytes()
+    manifest, manifest_digest = _json_object(
+        manifest_contents, "model_manifest.json"
+    )
+    formal_v3 = manifest.get("artifact_version") == "3.0.0"
+    artifact_paths = _artifact_paths(root, manifest)
+    feature_path = root / "feature_config.json"
+    feature_before = _file_stat(feature_path, "feature_config.json")
+    artifacts_before = tuple(
+        (role, _file_stat(path, relative_name))
+        for role, relative_name, path in artifact_paths
+    )
+
+    feature_contents = feature_path.read_bytes()
+    _, feature_digest = _json_object(feature_contents, "feature_config.json")
+
+    report_before = None
+    try:
+        report_before = _report_stats(root)
+    except FileNotFoundError:
+        if formal_v3:
+            raise OSError("v3 publication report set is incomplete")
+        pass
+    report_digests = None
+    if report_before is not None:
+        report_digests = _report_digests(root)
+    generation_before = _generation_identity(root)
+    if formal_v3 and generation_before is None:
+        raise OSError("formal v3 publication generation metadata is required")
+
+    directory_after = _directory_stat(root)
+    manifest_after = _file_stat(manifest_path, "model_manifest.json")
+    feature_after = _file_stat(feature_path, "feature_config.json")
+    artifacts_after = tuple(
+        (role, _file_stat(path, relative_name))
+        for role, relative_name, path in artifact_paths
+    )
+    report_after = None
+    report_digests_after = None
+    if report_before is not None:
+        report_after = _report_stats(root)
+        report_digests_after = _report_digests(root)
+    generation_after = _generation_identity(root)
+    if (
+        directory_before != directory_after
+        or manifest_before != manifest_after
+        or feature_before != feature_after
+        or artifacts_before != artifacts_after
+        or report_before is not None and report_before != report_after
+        or report_before is not None and report_digests != report_digests_after
+        or generation_before != generation_after
+    ):
+        raise OSError("v3 publication changed while its identity was read")
+    return (
+        "v3",
+        directory_after,
+        (manifest_after, manifest_digest),
+        (feature_after, feature_digest),
+        artifacts_after,
+        tuple(
+            (filename, stat_details, digest)
+            for (filename, stat_details), (_, digest) in zip(
+                report_after or (), report_digests_after or ()
+            )
+        ),
+        generation_after,
+    )
+
+
+def _legacy_identity(
+    root: Path, directory_before: tuple[Any, ...], manifest_path: Path
+) -> tuple[Any, ...]:
+    legacy_config_path = root / "legacy_feature_config.json"
+    feature_path = root / "feature_config.json"
+    preprocess_path = root / "preprocess.joblib"
+    model_path = root / "price_mlp.pt"
+    try:
+        legacy_config_before = _file_stat(
+            legacy_config_path, "legacy_feature_config.json"
+        )
+    except FileNotFoundError:
+        legacy_config_before = None
+    feature_before = _file_stat(feature_path, "feature_config.json")
+    preprocess_before = _file_stat(preprocess_path, "preprocess.joblib")
+    model_before = _file_stat(model_path, "price_mlp.pt")
+
+    if legacy_config_before is not None:
+        legacy_config_contents = legacy_config_path.read_bytes()
+        _, legacy_config_digest = _json_object(
+            legacy_config_contents, "legacy_feature_config.json"
+        )
+    else:
+        legacy_config_digest = None
+    feature_contents = feature_path.read_bytes()
+    _, feature_digest = _json_object(feature_contents, "feature_config.json")
+
+    directory_after = _directory_stat(root)
+    try:
+        legacy_config_after = _file_stat(
+            legacy_config_path, "legacy_feature_config.json"
+        )
+    except FileNotFoundError:
+        legacy_config_after = None
+    if legacy_config_after is not None:
+        legacy_config_contents_after = legacy_config_path.read_bytes()
+        _, legacy_config_digest_after = _json_object(
+            legacy_config_contents_after, "legacy_feature_config.json"
+        )
+    else:
+        legacy_config_digest_after = None
+    feature_after = _file_stat(feature_path, "feature_config.json")
+    preprocess_after = _file_stat(preprocess_path, "preprocess.joblib")
+    model_after = _file_stat(model_path, "price_mlp.pt")
+    try:
+        manifest_path.stat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError("model manifest appeared while legacy identity was read")
+    if (
+        directory_before != directory_after
+        or legacy_config_before != legacy_config_after
+        or legacy_config_digest != legacy_config_digest_after
+        or feature_before != feature_after
+        or preprocess_before != preprocess_after
+        or model_before != model_after
+    ):
+        raise OSError("legacy publication changed while its identity was read")
+    return (
+        "legacy",
+        directory_after,
+        (legacy_config_after, legacy_config_digest),
+        (feature_after, feature_digest),
+        preprocess_after,
+        model_after,
+    )
+
+
+def _published_artifact_identity(models_dir: Path) -> tuple[Any, ...]:
+    root = Path(models_dir)
+    directory_before = _directory_stat(root)
+    manifest_path = root / "model_manifest.json"
+    try:
+        manifest_before = _file_stat(manifest_path, "model_manifest.json")
+    except FileNotFoundError:
+        return _legacy_identity(root, directory_before, manifest_path)
+    return _v3_identity(root, directory_before, manifest_path, manifest_before)
+
+
+def _read_published_identity(models_dir: Path) -> tuple[Any, ...] | None:
+    global _identity_failure_count
+    try:
+        identity = _published_artifact_identity(models_dir)
+    except MemoryError:
+        raise
+    except ValueError as exc:
+        raise ModelRuntimeError(
+            f"published model identity is invalid in {models_dir}: {exc}"
+        ) from exc
+    except OSError as exc:
+        _identity_failure_count += 1
+        if (
+            _cached_runtime is not None
+            and _identity_failure_count <= _STALE_IDENTITY_FAILURE_LIMIT
+        ):
+            return None
+        raise ModelRuntimeError(
+            f"published model artifacts are unavailable in {models_dir}: {exc}"
+        ) from exc
+    _identity_failure_count = 0
+    return identity
+
+
+def _get_model_runtime_snapshot() -> tuple[ModelRuntime, ModelPublicationState]:
+    global _cached_identity, _cached_runtime
+
+    models_dir = Path(settings.published_models_dir)
+    with _runtime_lock:
+        identity = _read_published_identity(models_dir)
+        if identity is None:
+            if _cached_runtime is None or _cached_identity is None:
+                raise ModelRuntimeError("no validated model publication is cached")
+            return _cached_runtime, ModelPublicationState(_cached_identity, True)
+
+        for _ in range(_PUBLICATION_LOAD_ATTEMPTS):
+            if _cached_runtime is not None and identity == _cached_identity:
+                return _cached_runtime, ModelPublicationState(identity, False)
+            try:
+                candidate = ModelRuntime.from_directory(models_dir)
+            except MemoryError:
+                raise
+            except ModelRuntimeError:
+                current_identity = _read_published_identity(models_dir)
+                if current_identity is None:
+                    if _cached_runtime is None or _cached_identity is None:
+                        raise ModelRuntimeError(
+                            "no validated model publication is cached"
+                        )
+                    return _cached_runtime, ModelPublicationState(
+                        _cached_identity, True
+                    )
+                if current_identity != identity:
+                    identity = current_identity
+                    continue
+                raise
+
+            current_identity = _read_published_identity(models_dir)
+            if current_identity is None:
+                if _cached_runtime is None or _cached_identity is None:
+                    raise ModelRuntimeError("no validated model publication is cached")
+                return _cached_runtime, ModelPublicationState(
+                    _cached_identity, True
+                )
+            if current_identity == identity:
+                _cached_runtime = candidate
+                _cached_identity = identity
+                return candidate, ModelPublicationState(identity, False)
+            identity = current_identity
+
+        raise ModelRuntimeError(
+            f"published model changed repeatedly while loading from {models_dir}"
+        )
+
+
+_last_prediction_state = threading.local()
+
+
+def get_model_runtime() -> ModelRuntime:
+    """Return the runtime for the current complete published artifact identity."""
+    runtime, publication = _get_model_runtime_snapshot()
+    _last_prediction_state.value = publication
+    return runtime
+
+
+def get_model_publication_state() -> ModelPublicationState:
+    """Read the current identity without loading a new runtime."""
+    models_dir = Path(settings.published_models_dir)
+    with _runtime_lock:
+        identity = _read_published_identity(models_dir)
+        if identity is not None:
+            return ModelPublicationState(identity, False)
+        if _cached_runtime is None or _cached_identity is None:
+            raise ModelRuntimeError("no validated model publication is cached")
+        return ModelPublicationState(_cached_identity, True)
+
+
+def take_last_prediction_publication_state() -> ModelPublicationState | None:
+    """Return and clear publication state recorded by predict_price_one."""
+    publication = getattr(_last_prediction_state, "value", None)
+    if hasattr(_last_prediction_state, "value"):
+        del _last_prediction_state.value
+    return publication
+
+
+def clear_model_runtime_cache() -> None:
+    """Atomically clear the process-local published runtime."""
+    global _cached_identity, _cached_runtime, _identity_failure_count
+
+    with _runtime_lock:
+        _cached_runtime = None
+        _cached_identity = None
+        _identity_failure_count = 0
+        take_last_prediction_publication_state()
+
+
+def reload_model_runtime() -> ModelRuntime:
+    """Atomically clear and load the current complete publication."""
+    global _cached_identity, _cached_runtime
+
+    with _runtime_lock:
+        _cached_runtime = None
+        _cached_identity = None
+        return get_model_runtime()
+
+
+def predict_price_one(car_dict: Mapping[str, Any]) -> float:
+    """Predict one vehicle price using the current published runtime."""
+    take_last_prediction_publication_state()
+    return get_model_runtime().predict_one(car_dict)
+
+
+get_model_runtime.cache_clear = clear_model_runtime_cache

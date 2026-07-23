@@ -23,6 +23,16 @@ class PredictRequest(BaseModel):
     vehicle_type: str = Field(default="car", min_length=1, max_length=50)
     color: str = Field(default="unknown", min_length=1, max_length=50)
     accident_history: str = Field(default="unknown", min_length=1, max_length=50)
+    seller_type: str | None = Field(default=None, min_length=1, max_length=50)
+    drivetrain: str | None = Field(default=None, min_length=1, max_length=50)
+    max_power_bhp: float | None = Field(default=None, gt=0, le=2000)
+    power_rpm: float | None = Field(default=None, gt=0, le=25000)
+    max_torque_nm: float | None = Field(default=None, gt=0, le=10000)
+    torque_rpm: float | None = Field(default=None, gt=0, le=25000)
+    length_mm: float | None = Field(default=None, ge=1000, le=10000)
+    width_mm: float | None = Field(default=None, ge=1000, le=5000)
+    height_mm: float | None = Field(default=None, ge=500, le=5000)
+    fuel_tank_liter: float | None = Field(default=None, gt=0, le=1000)
 
     @field_validator(
         "brand",
@@ -48,6 +58,16 @@ class PredictRequest(BaseModel):
             return None
         value = value.strip()
         return value or None
+
+    @field_validator("seller_type", "drivetrain", mode="before")
+    @classmethod
+    def normalize_optional_non_blank_text(cls, value):
+        if value is None or not isinstance(value, str):
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
 
 
 class HistoryQuery(BaseModel):
@@ -80,6 +100,8 @@ class MetricsResponse(BaseModel):
     mileage_unit: str = "km"
     data_source: dict = Field(default_factory=dict)
     model_version: str = "unknown"
+    model_type: str = "mlp"
+    feature_version: str = "2.0.0"
     sample_count: int = 0
     warnings: list[str] = Field(default_factory=list)
 
@@ -95,6 +117,8 @@ class ModelHealthResponse(BaseModel):
     mileage_unit: str = "km"
     data_source: dict = Field(default_factory=dict)
     model_version: str = "unknown"
+    model_type: str = "mlp"
+    feature_version: str = "2.0.0"
     sample_count: int = 0
 
 
@@ -102,6 +126,7 @@ class ModelCardResponse(BaseModel):
     artifact_version: str
     feature_version: str
     model_version: str
+    model_type: str = "mlp"
     currency: str
     price_unit: str
     mileage_unit: str
@@ -114,6 +139,10 @@ class ModelCardResponse(BaseModel):
     category_options: dict[str, list[str]] = Field(default_factory=dict)
     feature_descriptions: dict[str, str] = Field(default_factory=dict)
     limitations: list[str] = Field(default_factory=list)
+    cv_selection: dict = Field(default_factory=dict)
+    independent_holdout: dict = Field(default_factory=dict)
+    leaderboard: dict = Field(default_factory=dict)
+    error_analysis: dict = Field(default_factory=dict)
 
 
 class AssistantRequest(BaseModel):
@@ -143,6 +172,8 @@ class PredictResponse(BaseModel):
     price_unit: str = "INR"
     mileage_unit: str = "km"
     model_version: str = "unknown"
+    model_type: str = "mlp"
+    feature_version: str = "2.0.0"
     metrics: TestMetrics
     comment: str
 
