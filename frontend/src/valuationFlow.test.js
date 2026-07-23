@@ -5,6 +5,8 @@ import test from 'node:test'
 import {
   VALUATION_STEPS,
   getValuationSummary,
+  localizeEstimateComment,
+  scrollToRenderedResult,
   validateValuationStep,
 } from './valuationFlow.js'
 
@@ -30,6 +32,10 @@ const modelEvidenceSource = readFileSync(
 const appSource = readFileSync(
   new URL('./App.vue', import.meta.url),
   'utf8',
+)
+const runValuationSource = appSource.slice(
+  appSource.indexOf('async function runValuation(payload)'),
+  appSource.indexOf('\nfunction editValuation()'),
 )
 
 function controlTag(field) {
@@ -411,6 +417,87 @@ test('keeps result identity fields readable through explicit fallbacks', () => {
   }
   assert.match(estimatePanelSource, />模型版本</)
   assert.doesNotMatch(estimatePanelSource, /可信度|confidence percentage/i)
+})
+
+test('localizes standard experimental estimate comments with freeform dataset text', () => {
+  const standardComment = 'Experimental estimate from car-details-v4; test R2=0.873. The reference range is not a statistical confidence interval.'
+  const unknownSourceComment = 'Experimental estimate from unknown source; test R2=0.125. The reference range is not a statistical confidence interval.'
+
+  assert.equal(
+    localizeEstimateComment(standardComment),
+    '来自 car-details-v4 的实验性估值；测试集 R²=0.873。参考区间并非统计置信区间。',
+  )
+  assert.equal(
+    localizeEstimateComment(unknownSourceComment),
+    '来自 unknown source 的实验性估值；测试集 R²=0.125。参考区间并非统计置信区间。',
+  )
+})
+
+test('preserves a standard comment whose dataset is only whitespace', () => {
+  const comment = 'Experimental estimate from     ; test R2=0.873. The reference range is not a statistical confidence interval.'
+
+  assert.equal(localizeEstimateComment(comment), comment)
+})
+
+test('does not localize incomplete, multiline, or extended estimate comments', () => {
+  const comments = [
+    'Experimental estimate from ; test R2=0.873. The reference range is not a statistical confidence interval.',
+    'Experimental estimate from unknown\nsource; test R2=0.873. The reference range is not a statistical confidence interval.',
+    'Experimental estimate from unknown source; test R2=0.873.',
+    'Experimental estimate from unknown source; test R2=0.873. The reference range is not a statistical confidence interval. Extra text.',
+  ]
+
+  for (const comment of comments) {
+    assert.equal(localizeEstimateComment(comment), comment)
+  }
+  assert.equal(localizeEstimateComment('Custom model warning.'), 'Custom model warning.')
+})
+
+test('uses the existing fallback for blank and non-string estimate comments', () => {
+  assert.equal(localizeEstimateComment('   ', '现有回退文案'), '现有回退文案')
+  for (const value of [null, undefined, 0, false, [], {}]) {
+    assert.equal(localizeEstimateComment(value, '现有回退文案'), '现有回退文案')
+  }
+  assert.match(estimatePanelSource, /localizeEstimateComment\(props\.result\?\.comment, '当前结果未提供额外限制说明。'\)/)
+})
+
+test('waits for the result DOM update before scrolling to the top', async () => {
+  const events = []
+  let finishRender
+  const rendered = new Promise(resolve => { finishRender = resolve })
+  const scrolling = scrollToRenderedResult(
+    () => {
+      events.push('nextTick')
+      return rendered
+    },
+    options => events.push({ scrollTo: options }),
+  )
+
+  await Promise.resolve()
+  assert.deepEqual(events, ['nextTick'])
+
+  finishRender()
+  await scrolling
+  assert.deepEqual(events, [
+    'nextTick',
+    { scrollTo: { top: 0, behavior: 'auto' } },
+  ])
+})
+
+test('settles result scrolling and history refresh together only on the successful path', () => {
+  assert.match(appSource, /import \{ computed, nextTick, onMounted, ref \} from 'vue'/)
+  assert.match(appSource, /import \{ scrollToRenderedResult \} from '\.\/valuationFlow'/)
+
+  const catchBlock = runValuationSource.match(/catch \(error\) \{([\s\S]*?)\n  \} finally/)
+  assert.ok(catchBlock, 'expected runValuation to retain its catch/finally structure')
+  assert.doesNotMatch(catchBlock[1], /scrollToRenderedResult/)
+  assert.equal(runValuationSource.match(/scrollToRenderedResult\(/g)?.length, 1)
+  assert.equal(runValuationSource.match(/refreshHistory\(\)/g)?.length, 1)
+
+  assert.match(
+    runValuationSource,
+    /valuationEditing\.value = false\s+await Promise\.allSettled\(\[\s+scrollToRenderedResult\(nextTick, options => window\.scrollTo\(options\)\),\s+refreshHistory\(\),\s+\]\)/,
+  )
 })
 
 test('keeps valuation evidence progressive and scoped to the result view', () => {

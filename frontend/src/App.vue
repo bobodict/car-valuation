@@ -68,8 +68,9 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { askAssistant, getHistory, getMetrics, getModelCard, getModelHealth, predictVehicle } from './api'
+import { scrollToRenderedResult } from './valuationFlow'
 import AssistantPanel from './components/AssistantPanel.vue'
 import EstimatePanel from './components/EstimatePanel.vue'
 import HistoryLog from './components/HistoryLog.vue'
@@ -171,7 +172,10 @@ async function runValuation(payload) {
   prediction.value = result
   lastValuationInput.value = { ...payload }
   valuationEditing.value = false
-  await refreshHistory()
+  await Promise.allSettled([
+    scrollToRenderedResult(nextTick, options => window.scrollTo(options)),
+    refreshHistory(),
+  ])
 }
 
 function editValuation() {

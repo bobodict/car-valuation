@@ -27,7 +27,7 @@
 
 <script setup>
 import { computed } from 'vue'
-import { getValuationSummary } from '../valuationFlow'
+import { getValuationSummary, localizeEstimateComment } from '../valuationFlow'
 
 const props = defineProps({
   result: { type: Object, default: null },
@@ -49,6 +49,6 @@ const displayText = (value, fallback) => typeof value === 'string' && value.trim
 const displayPrice = computed(() => formatPrice(props.result?.price))
 const displayCurrency = computed(() => displayText(props.result?.currency, '--'))
 const displayUnit = computed(() => displayText(props.result?.price_unit, '--'))
-const displayComment = computed(() => displayText(props.result?.comment, '当前结果未提供额外限制说明。'))
+const displayComment = computed(() => localizeEstimateComment(props.result?.comment, '当前结果未提供额外限制说明。'))
 const displayModelVersion = computed(() => displayText(props.result?.model_version, 'unknown'))
 </script>

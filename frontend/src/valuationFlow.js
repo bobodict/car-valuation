@@ -36,6 +36,25 @@ function displayNumber(value) {
   return number === null ? '--' : String(number)
 }
 
+const standardEstimateComment = /^Experimental estimate from ([^\r\n]+?); test R2=(-?[0-9]+(?:\.[0-9]+)?)\. The reference range is not a statistical confidence interval\.$/
+
+export function localizeEstimateComment(value, fallback) {
+  const comment = displayText(value, fallback)
+  const match = comment.match(standardEstimateComment)
+  if (!match) return comment
+
+  const dataset = match[1].trim()
+  if (!dataset) return comment
+
+  const rSquared = match[2]
+  return `来自 ${dataset} 的实验性估值；测试集 R²=${rSquared}。参考区间并非统计置信区间。`
+}
+
+export async function scrollToRenderedResult(nextTick, scrollTo) {
+  await nextTick()
+  scrollTo({ top: 0, behavior: 'auto' })
+}
+
 export function validateValuationStep(form, stepIndex, currentYear = new Date().getFullYear()) {
   const fields = VALUATION_STEPS[stepIndex]?.fields || []
   const errors = {}
