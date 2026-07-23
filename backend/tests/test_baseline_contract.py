@@ -1,8 +1,10 @@
+import json
 import unittest
 from unittest.mock import patch
 
 from pydantic import ValidationError
 
+from config import settings
 from schemas import HistoryQuery, PredictRequest
 from services.metrics_service import load_metrics
 from services.model_service import ModelServiceError, build_model_input, call_model_api
@@ -99,11 +101,24 @@ class ModelAdapterTests(unittest.TestCase):
 
 class MetricsTests(unittest.TestCase):
     def test_artifact_metrics_are_loaded_from_backend_model_directory(self):
+        artifact = json.loads(settings.metrics_path.read_text(encoding="utf-8"))
+        feature_config = json.loads(
+            settings.feature_config_path.read_text(encoding="utf-8")
+        )
         metrics = load_metrics()
+        test_metrics = metrics["test_metrics"]
 
-        self.assertAlmostEqual(metrics["test_metrics"]["r2"], 0.8635845112741601)
-        self.assertAlmostEqual(metrics["test_metrics"]["acc_10"], 0.2912621359223301)
-        self.assertEqual(metrics["quality_gate"], "fail")
+        self.assertEqual(artifact["artifact_version"], "3.0.0")
+        self.assertEqual(artifact["model_type"], "catboost")
+        self.assertRegex(artifact["model_version"], r"^v3-.+")
+        self.assertEqual(feature_config["feature_version"], "3.0.0")
+        self.assertEqual(metrics["feature_version"], feature_config["feature_version"])
+        self.assertEqual(metrics["model_type"], artifact["model_type"])
+        self.assertEqual(metrics["model_version"], artifact["model_version"])
+        self.assertEqual(metrics["quality_gate"], "pass")
+        self.assertGreater(test_metrics["r2"], 0)
+        self.assertGreaterEqual(test_metrics["acc_10"], 0.50)
+        self.assertLess(test_metrics["rmse"], test_metrics["baseline_rmse"])
         self.assertEqual(metrics["currency"], "INR")
         self.assertEqual(metrics["mileage_unit"], "km")
 
