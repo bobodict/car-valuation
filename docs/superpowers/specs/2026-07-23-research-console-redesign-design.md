@@ -51,4 +51,3 @@ The frontend continues to call `GET /api/model-card`, `GET /api/model-health`, `
 - Signal orange: `#e3633b`; cold blue: `#2e647d`; success teal: `#1f806b`; muted line: `#d9d4ca`.
 - Display typography: Georgia for the research title; body: system sans; technical labels and metrics: IBM Plex Mono fallback.
 - Radius stays small (6px) and panels remain framed only where they contain a discrete tool or repeated evidence item.
-

@@ -78,4 +78,3 @@ Use agent-browser to inspect the Research default view at desktop and narrow mob
 - [ ] **Step 4: Commit the frontend task**
 
 Run `git diff --check`, `npm run build`, and commit the frontend/spec/plan changes with `feat: redesign research console`.
-
