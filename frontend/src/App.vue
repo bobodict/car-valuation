@@ -40,12 +40,14 @@
             <ValuationForm :card="modelCard" :loading="predictionLoading" :error="predictionError" @submit="runValuation" @reset="clearPrediction" />
           </div>
           <div v-if="prediction && !valuationEditing" class="result-stage">
+            <div v-if="historyError" class="inline-error" role="alert">{{ historyError }}</div>
             <EstimatePanel :result="prediction" :input="lastValuationInput" @edit="editValuation" />
+            <button class="button button-quiet" type="button" @click="editValuation">修改车辆信息</button>
           </div>
         </section>
         <section v-else-if="activeView === 'research'" class="view-stack"><ResearchOverview :card="modelCard" /></section>
         <section v-else-if="activeView === 'assistant'" class="view-stack"><AssistantPanel :response="assistantResponse" :loading="assistantLoading" :error="assistantError" @submit="askQuestion" /></section>
-        <section v-else class="view-stack"><HistoryLog :history="history" :loading="historyLoading" :error="historyError" /></section>
+        <section v-else-if="activeView === 'history'" class="view-stack"><HistoryLog :history="history" :loading="historyLoading" :error="historyError" /></section>
       </template>
       <footer class="main-footer"><span>车辆估值 · INR</span><span>结果仅供参考</span></footer>
     </main>
@@ -119,9 +121,12 @@ async function runValuation(payload) {
     prediction.value = result
     lastValuationInput.value = { ...payload }
     valuationEditing.value = false
+    historyError.value = ''
     historyLoading.value = true
     try {
       history.value = await getHistory()
+    } catch (error) {
+      historyError.value = error.message || '历史记录暂时无法刷新'
     } finally {
       historyLoading.value = false
     }
