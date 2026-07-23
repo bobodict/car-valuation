@@ -329,6 +329,115 @@ class ModelMetadataTests(unittest.TestCase):
         self.assertEqual(new_metrics["quality_gate"], "pass")
         self.assertEqual(publication_state.call_count, 4)
 
+    def test_metrics_route_retries_a_publication_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.json"
+            path.write_text(
+                json.dumps(make_metrics(model_version="new-v3")), encoding="utf-8"
+            )
+            old_identity = ("publication", "old")
+            new_identity = ("publication", "new")
+
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with (
+                    patch.object(
+                        metrics_service,
+                        "settings",
+                        SimpleNamespace(metrics_path=path),
+                    ),
+                    patch.object(
+                        metrics_service,
+                        "get_model_publication_state",
+                        side_effect=[
+                            (old_identity, False),
+                            (new_identity, False),
+                            (new_identity, False),
+                            (new_identity, False),
+                        ],
+                    ) as publication_state,
+                ):
+                    response = MetricsResponse.model_validate(get_metrics())
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        self.assertEqual(response.model_version, "new-v3")
+        self.assertEqual(publication_state.call_count, 4)
+
+    def test_model_health_route_exhausts_publication_change_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.json"
+            path.write_text(json.dumps(make_metrics()), encoding="utf-8")
+            states = [
+                (("publication", attempt, phase), False)
+                for attempt in range(3)
+                for phase in ("before", "after")
+            ]
+
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with (
+                    patch.object(
+                        metrics_service,
+                        "settings",
+                        SimpleNamespace(metrics_path=path),
+                    ),
+                    patch.object(
+                        metrics_service,
+                        "get_model_publication_state",
+                        side_effect=states,
+                    ) as publication_state,
+                ):
+                    with self.assertRaisesRegex(
+                        metrics_service.MetricsPublicationChanged,
+                        "repeatedly",
+                    ):
+                        model_health()
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        self.assertEqual(publication_state.call_count, 6)
+
+    def test_cached_metrics_returns_are_mutation_isolated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.json"
+            path.write_text(
+                json.dumps(
+                    make_metrics(
+                        warnings=["original warning"],
+                        data_source={"source_id": "original-source"},
+                    )
+                ),
+                encoding="utf-8",
+            )
+            identity = ("publication", "stable")
+
+            metrics_service.load_metrics.cache_clear()
+            try:
+                with (
+                    patch.object(
+                        metrics_service,
+                        "settings",
+                        SimpleNamespace(metrics_path=path),
+                    ),
+                    patch.object(
+                        metrics_service,
+                        "get_model_publication_state",
+                        return_value=(identity, False),
+                    ),
+                ):
+                    first = metrics_service.load_metrics()
+                    first["test_metrics"]["r2"] = 999.0
+                    first["data_source"]["source_id"] = "mutated-source"
+                    first["warnings"].append("mutated warning")
+                    second = metrics_service.load_metrics()
+            finally:
+                metrics_service.load_metrics.cache_clear()
+
+        self.assertEqual(second["test_metrics"]["r2"], 0.1)
+        self.assertEqual(second["data_source"]["source_id"], "original-source")
+        self.assertEqual(second["warnings"], ["original warning"])
+
     def test_metrics_gap_uses_cached_snapshot_once_then_fails_explicitly(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)

@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from copy import deepcopy
 import hashlib
 import json
 import threading
@@ -19,6 +20,7 @@ _cached_snapshots: OrderedDict[
     tuple[Any, ...], tuple[bytes, dict]
 ] = OrderedDict()
 _CACHED_PUBLICATION_LIMIT = 2
+_PUBLICATION_READ_ATTEMPTS = 3
 
 
 def _cached_metrics(identity: tuple[Any, ...]) -> dict | None:
@@ -26,7 +28,7 @@ def _cached_metrics(identity: tuple[Any, ...]) -> dict | None:
     if snapshot is None:
         return None
     _cached_snapshots.move_to_end(identity)
-    return snapshot[1]
+    return deepcopy(snapshot[1])
 
 
 def _require_cached_metrics(identity: tuple[Any, ...]) -> dict:
@@ -45,7 +47,7 @@ def _store_metrics(
     _cached_snapshots.move_to_end(identity)
     while len(_cached_snapshots) > _CACHED_PUBLICATION_LIMIT:
         _cached_snapshots.popitem(last=False)
-    return metrics
+    return deepcopy(metrics)
 
 
 def _validated_metrics(contents: bytes) -> dict:
@@ -119,7 +121,7 @@ def _load_metrics_for_state(
     cached = _cached_snapshots.get(expected_identity)
     if cached is not None and cached[0] == fingerprint:
         _cached_snapshots.move_to_end(expected_identity)
-        return cached[1]
+        return deepcopy(cached[1])
     return _store_metrics(
         expected_identity, fingerprint, _validated_metrics(contents)
     )
@@ -140,9 +142,17 @@ def load_metrics_for_publication(
 def load_metrics() -> dict:
     """Load metrics for the current complete model publication."""
     with _cache_lock:
-        publication = get_model_publication_state()
-        identity, _ = publication
-        return _load_metrics_for_state(identity, publication)
+        last_change = None
+        for _ in range(_PUBLICATION_READ_ATTEMPTS):
+            publication = get_model_publication_state()
+            identity, _ = publication
+            try:
+                return _load_metrics_for_state(identity, publication)
+            except MetricsPublicationChanged as exc:
+                last_change = exc
+        raise MetricsPublicationChanged(
+            "model publication changed repeatedly while metrics were loaded"
+        ) from last_change
 
 
 def _clear_metrics_cache() -> None:

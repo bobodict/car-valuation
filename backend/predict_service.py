@@ -320,12 +320,4 @@ def predict_price_one(car_dict: Mapping[str, Any]) -> float:
     return get_model_runtime().predict_one(car_dict)
 
 
-def predict_price_one_with_identity(
-    car_dict: Mapping[str, Any],
-) -> tuple[float, ModelPublicationState]:
-    """Predict with the exact runtime publication used for the result."""
-    runtime, publication = _get_model_runtime_snapshot()
-    return runtime.predict_one(car_dict), publication
-
-
 get_model_runtime.cache_clear = clear_model_runtime_cache
