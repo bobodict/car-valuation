@@ -6,7 +6,6 @@ from pathlib import Path
 from config import settings
 from predict_service import get_model_publication_state
 from services.publication_validation import (
-    is_formal_v3_manifest,
     validate_formal_v3_reports,
 )
 
@@ -39,10 +38,18 @@ def _load_optional_object(path: Path) -> dict:
     return value
 
 
+def _is_active_publication_root(root: Path) -> bool:
+    published_root = getattr(settings, "published_models_dir", None)
+    if published_root is None:
+        return False
+    return root.resolve() == Path(published_root).resolve()
+
+
 def load_model_card(path: str | Path | None = None) -> dict:
     card_path = Path(path) if path else settings.models_dir / "model_card.json"
     expected_identity = None
-    if path is None and is_formal_v3_manifest(card_path.parent):
+    checks_publication = path is None or _is_active_publication_root(card_path.parent)
+    if checks_publication:
         expected_identity, initial_is_stale = get_model_publication_state()
         if initial_is_stale:
             raise ValueError("model publication changed while model card was read")
@@ -53,11 +60,6 @@ def load_model_card(path: str | Path | None = None) -> dict:
             card = json.load(card_file)
     else:
         card = formal_reports["model_card.json"]
-
-    if expected_identity is not None:
-        final_identity, final_is_stale = get_model_publication_state()
-        if final_identity != expected_identity or final_is_stale:
-            raise ValueError("model publication changed while model card was read")
 
     if not isinstance(card, dict):
         raise ValueError("model card must contain a JSON object")
@@ -105,4 +107,8 @@ def load_model_card(path: str | Path | None = None) -> dict:
         )
     if not isinstance(card["thresholds"], dict):
         raise ValueError("model card thresholds must be an object")
+    if expected_identity is not None:
+        final_identity, final_is_stale = get_model_publication_state()
+        if final_identity != expected_identity or final_is_stale:
+            raise ValueError("model publication changed while model card was read")
     return card

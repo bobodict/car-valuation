@@ -522,6 +522,69 @@ class ModelMetadataTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "publication changed"):
                     load_model_card()
 
+    def test_default_legacy_model_card_rejects_transition_to_formal_before_final_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            root.mkdir()
+            (root / "model_card.json").write_text(
+                json.dumps(make_card()), encoding="utf-8"
+            )
+            old_identity = ("publication", "legacy")
+            new_identity = ("publication", "formal")
+
+            def transition_to_formal(_root):
+                (root / "model_manifest.json").write_text(
+                    json.dumps({"artifact_version": "3.0.0"}), encoding="utf-8"
+                )
+                return None
+
+            with (
+                patch.object(
+                    model_metadata, "settings", SimpleNamespace(models_dir=root)
+                ),
+                patch.object(
+                    model_metadata,
+                    "get_model_publication_state",
+                    create=True,
+                    side_effect=[
+                        (old_identity, False),
+                        (new_identity, False),
+                    ],
+                ),
+                patch.object(
+                    model_metadata,
+                    "validate_formal_v3_reports",
+                    side_effect=transition_to_formal,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "publication changed"):
+                    load_model_card()
+
+    def test_explicit_active_formal_model_card_rejects_publication_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            shutil.copytree(settings.models_dir, root)
+            old_identity = ("publication", "old")
+            new_identity = ("publication", "new")
+            with (
+                patch.object(
+                    model_metadata,
+                    "settings",
+                    SimpleNamespace(models_dir=root, published_models_dir=root),
+                ),
+                patch.object(
+                    model_metadata,
+                    "get_model_publication_state",
+                    create=True,
+                    side_effect=[
+                        (old_identity, False),
+                        (new_identity, False),
+                    ],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "publication changed"):
+                    load_model_card(root / "model_card.json")
+
     def test_formal_report_symlinks_are_rejected_by_validation_and_identity(self):
         for filename in publication_validation.V3_REPORT_FILES:
             with self.subTest(filename=filename):
